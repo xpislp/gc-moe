@@ -30,7 +30,7 @@ from ..common.math import (
     warp_group4_max,
 )
 from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
-from ..common.direct_pull import cache_peer_tile, load_cached_k128
+from ..common.direct_pull import cache_peer_tile, publish_cached_stage
 from ..common.ll_routes import materialize_routes
 from ..layout.gc_moe import (
     ACCUM_BARRIER_STAGES,
@@ -41,6 +41,7 @@ from ..layout.gc_moe import (
     SIGNAL_OFFSETS,
 )
 from ..layout.sym_buffer import mapped_peer_base
+from ..layout.direct_pull import get_direct_pull_cache_layout
 from ..mma.sm100 import (
     MixedMmaTile,
     blockscaled_instr_desc_hi,
@@ -335,7 +336,8 @@ class GCMoERoleKernel:
         self.cd_bytes = max(self.cd_l1_bytes, self.cd_l2_bytes)
         # float2[kNumEpilogueWarps][STORE_BLOCK_M_L1 / 2].
         self.amax_float_count = 8 * self.store_m_l1
-        self.non_epi_registers = 40 if local_experts <= 64 else 72
+        self.non_epi_registers = (80 if direct_pull and role == 2 else
+                                  40 if local_experts <= 64 else 72)
         self.epi_registers = 208 if local_experts <= 64 else 168
         tile = MixedMmaTile(block_m, hidden, intermediate)
         self.l1_clusters = tile.l1_clusters
@@ -373,10 +375,10 @@ class GCMoERoleKernel:
             self.finalize_sms = min(compute_sms, max(8,
                 (num_tokens * self.combine_chunks + COMBINE_WARPS - 1) // COMBINE_WARPS))
         self.shared_layout = role_config.shared_layout
-        self.ll_cache_offset = (self.shared_layout.field_end + 1023) // 1024 * 1024
-        self.ll_sf_offset = self.ll_cache_offset + block_m // 2 * hidden
-        self.ll_bar_offset = self.ll_sf_offset + block_m * (hidden // 128) * 4
-        self.smem_bytes = (self.ll_bar_offset + 8 if direct_pull and role == 2
+        self.direct_cache = (get_direct_pull_cache_layout(
+            self.shared_layout.field_end, block_m, hidden)
+            if direct_pull and role == 2 else None)
+        self.smem_bytes = (self.direct_cache.end if self.direct_cache is not None
                            else self.shared_layout.field_end)
         layout = GCBufferLayout(num_ranks, num_ranks * local_experts, capacity, topk,
                                 hidden, intermediate, ring_tokens, sf_ring_tokens,
@@ -448,10 +450,6 @@ class GCMoERoleKernel:
             # math_stages <= 32 bound keeps all stages within one warp.
             if cutlass.const_expr(self.role == 2):
                 cta_rank, _, _ = cute.arch.block_in_cluster_idx()
-                if cutlass.const_expr(self.direct_pull):
-                    if lane == 0:
-                        cute.arch.mbarrier_init(cute.recast_ptr(
-                            slab + self.ll_bar_offset, dtype=Uint64), 1)
                 data_full = cute.recast_ptr(slab + self.shared_layout.data_full, dtype=Uint64)
                 data_empty = cute.recast_ptr(slab + self.shared_layout.data_empty, dtype=Uint64)
                 if lane < self.math_stages:
@@ -1247,7 +1245,6 @@ class GCMoERoleKernel:
                 task_iter = Uint32(0)
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
-                cache_phase = Uint32(0)
                 cached_pool = Uint32(0xffffffff)
                 running = True
                 while running:
@@ -1318,14 +1315,19 @@ class GCMoERoleKernel:
                                 pass
                             if cutlass.const_expr(self.direct_pull):
                                 if cached_pool != pool_block:
+                                    if cached_pool != Uint32(0xffffffff):
+                                        # Direct MMA descriptors retain cache addresses.
+                                        # Drain BOTH CTAs' last consumer before overwrite.
+                                        cute.arch.mbarrier_wait(
+                                            accum_full + (task_iter - Uint32(1)) % Uint32(self.accum_stages),
+                                            ((task_iter - Uint32(1)) // Uint32(self.accum_stages)) % Uint32(2))
                                     cache_peer_tile(
-                                        signals, peer_ptrs, slab + self.ll_cache_offset,
-                                        cute.recast_ptr(slab + self.ll_sf_offset, dtype=Uint32),
-                                        cute.recast_ptr(slab + self.ll_bar_offset, dtype=Uint64),
-                                        cache_phase, pool_block, valid_m, cta_rank, Uint32(lane),
+                                        signals, peer_ptrs, slab + self.direct_cache.x,
+                                        cute.recast_ptr(slab + self.direct_cache.sf, dtype=Uint32),
+                                        pool_block, valid_m, cta_rank, Uint32(lane),
                                         self.block_m, self.hidden, self.num_ranks,
-                                        self.metadata_words, self.input_x_words, self.input_sf_words)
-                                    cache_phase ^= Uint32(1)
+                                        self.metadata_words, self.input_x_words, self.input_sf_words,
+                                        self.direct_cache.sf_stride, self.direct_cache.sf_words)
                                     cached_pool = pool_block
                         if cutlass.const_expr(self.shared_experts > 0):
                             if task_phase == Uint32(GCBlockPhase.SharedLinear2):
@@ -1352,15 +1354,8 @@ class GCMoERoleKernel:
                                     pending = ld_acquire_gpu_u64(mask_ptr) ^ expected
                             if cutlass.const_expr(self.direct_pull):
                                 if task_phase == Uint32(GCBlockPhase.Linear1):
-                                    load_cached_k128(
-                                        slab + self.ll_cache_offset,
-                                        cute.recast_ptr(slab + self.ll_sf_offset, dtype=Uint32),
-                                        data_a + data_stage * (self.block_m // 2 * 128),
-                                        data_sfa + data_stage * self.sf_block_m,
-                                        data_full + data_stage, data_empty + data_stage,
-                                        k_block, data_phase, valid_m,
-                                        Uint32(lane), self.block_m,
-                                        self.sf_block_m, self.hidden)
+                                    publish_cached_stage(data_full + data_stage,
+                                                         data_empty + data_stage, data_phase)
                                 else:
                                     load_mixed_k128_tma(
                                         activation_map, activation_sf_map,
@@ -1529,9 +1524,19 @@ class GCMoERoleKernel:
                             activation_desc_start = Uint32(
                                 Uint32(activation_desc_base) + data_stage *
                                 Uint32((self.block_m // 2 * 128) // 16))
+                            activation_sf_base = data_sfa
+                            activation_sf_offset = data_stage * Uint32(self.sf_block_m)
+                            if cutlass.const_expr(self.direct_pull):
+                                if task_phase == Uint32(GCBlockPhase.Linear1):
+                                    activation_desc_start = Uint32(
+                                        Uint32((slab + self.direct_cache.x).toint()) // Uint32(16) +
+                                        k_block * Uint32(self.block_m // 2 * 128 // 16))
+                                    activation_sf_base = cute.recast_ptr(
+                                        slab + self.direct_cache.sf, dtype=Uint32)
+                                    activation_sf_offset = k_block * Uint32(self.direct_cache.sf_stride)
                             issue_mixed_k128(
                                 weight_desc_start, activation_desc_start,
-                                data_sfb, data_sfa, data_stage,
+                                data_sfb, activation_sf_base, data_stage,
                                 data_desc_hi, sf_desc_hi,
                                 accum_stage * Uint32(self.block_m),
                                 Uint32(self.accum_stages * self.block_m +
@@ -1543,7 +1548,7 @@ class GCMoERoleKernel:
                                 is_shared, self.sf_block_m,
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
-                                self.use_small_tile_path)
+                                self.use_small_tile_path, activation_sf_offset)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))

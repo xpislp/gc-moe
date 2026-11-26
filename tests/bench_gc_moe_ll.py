@@ -7,6 +7,7 @@ so each GPU keeps eight experts and balanced M/expert=T at EP4 and EP32.
 from pathlib import Path
 import argparse
 import json
+import hashlib
 import os
 import statistics
 import subprocess
@@ -99,7 +100,8 @@ def stage(buffer, x, idx, prob, tokens, experts, world, topk, variant):
     buffer.topk_weights[:tokens].copy_(prob)
     if buffer.num_shared_experts:
         query = gc_moe.get_block_m_for_gc_moe if variant == "gc" else gc_moe.get_block_m_for_gc_moe_ll
-        bm = query(world, experts, buffer.num_max_tokens_per_rank, tokens, topk)
+        query_options = {} if variant == "gc" else dict(direct_pull=variant == "ll_direct")
+        bm = query(world, experts, buffer.num_max_tokens_per_rank, tokens, topk, **query_options)
         rows = torch.arange(tokens, device='cuda')
         u = rows % bm
         sf_rows = rows // bm * ((bm + 127)//128*128) + (u//128)*128 + (u%32)*4 + (u%128)//32
@@ -129,7 +131,7 @@ def main():
     p.add_argument('--topk', type=int, default=8)
     p.add_argument('--shared', type=int, default=1, choices=(0,1))
     p.add_argument('--variants', default='gc,ll_stage,ll_direct')
-    p.add_argument('--patterns', default='balanced,random,skew,empty')
+    p.add_argument('--patterns', default='balanced,random,skew,empty,mixed')
     p.add_argument('--repeats', type=int, default=7)
     p.add_argument('--graph-calls', type=int, default=20)
     p.add_argument('--profile', action='store_true')
@@ -167,8 +169,8 @@ def main():
             kwargs = {} if v in ('gc', 'll') else dict(direct_pull=v=='ll_direct')
             fn(ys[v], *weights, buffers[v], *sw, shared_recipe=(1,128,128), **kwargs)
         graphs = {}
-        for pattern in args.patterns.split(','):
-            torch.manual_seed(1000+rank+tokens)
+        for pattern_index, pattern in enumerate(args.patterns.split(',')):
+            torch.manual_seed(1000 + rank + tokens + pattern_index * 10000)
             x = quantize(torch.randn((tokens,h),device=device)*.5)
             if pattern == 'balanced':
                 idx = ((torch.arange(tokens, device=device)[:,None]+rank*tokens)*k + torch.arange(k,device=device)[None,:]) % e
@@ -178,6 +180,9 @@ def main():
                 idx = torch.arange(k,device=device)[None,:].expand(tokens,-1).contiguous()
             else:
                 idx = torch.rand((tokens,e),device=device).topk(k,dim=-1).indices
+            if pattern == 'mixed':
+                mask = (torch.arange(tokens*k,device=device).reshape(tokens,k)+rank) % 3 == 0
+                idx = idx.masked_fill(mask,-1)
             prob = torch.randn((tokens,k),device=device).softmax(-1)
             expected = reference(dequant(x),idx,prob,raw,shared,rank,world)
             for v in variants:
@@ -223,10 +228,14 @@ def main():
         # Captured graphs retain their buffer/weight owners. Process lifetime
         # cleanup is intentional; do not destroy allocations still in graphs.
     if rank == 0:
+        source_hashes = {str(p.relative_to(Path(__file__).resolve().parents[1])):
+            hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted((Path(__file__).resolve().parents[1] / 'gc_moe').rglob('*.py'))}
         out=Path(args.output);out.parent.mkdir(parents=True,exist_ok=True)
         out.write_text(json.dumps(dict(args=vars(args),world=world,torch=torch.__version__,
             capability=torch.cuda.get_device_capability(),gpu=torch.cuda.get_device_name(),
             cuda=torch.version.cuda, cutlass=importlib.metadata.version('nvidia-cutlass-dsl'),
+            source_sha256=source_hashes,
             git_commit=git_output('rev-parse','HEAD'),
             git_status=git_output('status','--porcelain'),
             ll_environment={k:v for k,v in os.environ.items() if k.startswith('GC_MOE_LL_')},

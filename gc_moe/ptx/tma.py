@@ -265,3 +265,10 @@ def copy_arrive(bar: cute.Pointer, *, loc=None, ip=None):
                     'cp.async.mbarrier.arrive.noinc.shared.b64 [$0];',
                     'r,~{memory}', has_side_effects=True,
                     asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_wait_six(*, loc=None, ip=None):
+    """Bound the gather to six outstanding committed cp.async groups."""
+    llvm.inline_asm(None, [], 'cp.async.wait_group 6;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)

@@ -1,6 +1,8 @@
 # SM100 小 batch MoE：实现与 EP4 实测
 
 新增接口 `gc_moe.fp8_fp4_gc_moe_ll`，支持 T/rank ≤ 32、EP ≤ 32。
+
+直接拉取路径现已去掉共享内存二次重排，最新实现、对照结果与限制见 [直接布局优化报告](sm100_direct_pull_optimization.md)。本页性能表保留初版 `878682f` 的记录。
 这是对现有 SM100 MMA/量化/输出管线的低延迟特化：新写了路由登记、直接拉取缓存及其调度路径，复用已有 FP8×FP4 数学管线。不是将原接口改名，也不是完全重写所有 MMA/epilogue。
 
 ## 默认路径与实验路径
@@ -16,12 +18,12 @@
 `direct_pull=True` 保留讨论中的直接拉取方案，供后续研究：
 
 - 单个路由 CTA 建表，之后一条 lane 整理一条路由，输出 `(src_rank, src_token, topk_slot)` 和权重；不写 routed X/SF 全局暂存区。
-- 计算 CTA 直接通过 peer UVA + bulk G2S 将完整小 M 输入 tile 缓存在自己的共享内存，再按 K128 转成 MMA 所需 SW128 布局；权重 TMA 与 MMA 继续多级流水。
+- 计算 CTA 用 peer UVA + `cp.async` 将 X 直接写入 K128/SW128 缓存，将 SF 直接写入 MMA 消费的排列；MMA 描述符直接引用这些地址，不再将缓存搬进第二份 SMEM stage。权重 TMA 与 MMA 继续多级流水。
 - 两个连续 W1 N tile 分配给同一 cluster，复用输入缓存。完整缓存需要共享内存，因此减少权重流水级数，并在编译前检查容量。
-- cache 仅由 activation loader warp 读写；每个 K 块拷贝到独立流水 stage 后，后续 MMA 不再访问 cache。下一个任务覆盖 cache 不会覆盖仍在计算的 stage。
+- cache 由 activation loader warp 填充、MMA 直接读取。切换到另一 pool block 前，各 CTA 等待紧邻上一任务的 MMA 完成，避免覆盖仍在使用的数据；复用同一 pool block 时保持缓存不变。
 - 目前只接受 H 为 512 的倍数且 H ≤ 8192。实验路径未被默认自动选择。
 
-第一版逐 K128 远端读取并等待的实现约 260–330 µs，等待链太长，已替换。整块缓存及 N tile 复用后明显改善，但最终仍慢于默认路径。增加 N 分组到 4 会减少并行度，实测也更慢。保留独立实验开关而非宣称“直接放共享内存一定快”。
+第一版逐 K128 远端读取并等待的实现约 260–330 µs，等待链太长，已替换。整块缓存及 N tile 复用后明显改善，但最终仍慢于默认路径。增加 N 分组到 4 会减少并行度，实测也更慢。后续直接布局优化结果见本文开头链接。保留独立实验开关而非宣称“直接放共享内存一定快”。
 
 没有实现完整 W1→SwiGLU→W2 的 I 分片融合或 split-K。以 M=32、H=6144、I=2048、I 分片=128 为例，16 份 FP32 W2 partial 在每专家会占约 12 MiB，8 专家约 96 MiB；现有 FP8 中间激活总共约 0.5 MiB。若把 partial 写到显存再归约，额外读写可能超过省下的中间激活流量。避免 partial 落地的融合方案仍需独立实现及验证。
 
@@ -50,14 +52,16 @@
 
 ## 使用与复现
 
-复用 `get_symm_buffer_for_gc_moe` 和 `transform_weights_for_gc_moe` 的权重/输入契约。**共享输入 scale 的排布必须查询 LL 的 BM**，不能直接使用原接口的 BM；T=32 时二者不同：
+复用 `get_symm_buffer_for_gc_moe` 和 `transform_weights_for_gc_moe` 的权重/输入契约。**共享输入 scale 的排布必须查询 LL 的 BM，且传入与算子相同的 `direct_pull` 值**，不能直接使用原接口的 BM。目前 GLM5.2 均衡参数下，直接路径 T≤32 使用 BM16，默认路径 T≤16 使用 BM16、T=32 使用 BM32：
 
 ```python
-bm = gc_moe.get_block_m_for_gc_moe_ll(ep, experts, capacity, tokens, topk)
+direct_pull = False  # 实验直接路径改成 True；两处必须一致
+bm = gc_moe.get_block_m_for_gc_moe_ll(
+    ep, experts, capacity, tokens, topk, direct_pull=direct_pull)
 # 按 BM 将 x_sf 放到 buffer.shared_l1_acts_sf，见测试 stage()。
 gc_moe.fp8_fp4_gc_moe_ll(
     y, routed_w1, routed_w2, buffer,
-    shared_w1, shared_w2, shared_recipe=(1, 128, 128),
+    shared_w1, shared_w2, shared_recipe=(1, 128, 128), direct_pull=direct_pull,
 )
 ```
 

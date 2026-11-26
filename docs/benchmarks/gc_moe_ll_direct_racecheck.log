@@ -1,0 +1,8 @@
+Shared-memory racecheck; exit status 0. CUDA API error reporting disabled.
+Filter: --kernel-name kns=kernel_cutlass_kernel_
+Options: --tool racecheck --report-api-errors no --target-processes all --error-exitcode 99
+CONFIG {'tokens': '17', 'hidden': 1536, 'intermediate': 2048, 'local_experts': 8, 'topk': 8, 'shared': 1, 'variants': 'll_direct', 'patterns': 'balanced,skew,mixed', 'repeats': 1, 'graph_calls': 1, 'profile': False, 'output': 'results/ll/direct_racecheck.json'} EP 4
+CHECK 17 balanced ll_direct
+CHECK 17 skew ll_direct
+CHECK 17 mixed ll_direct
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)

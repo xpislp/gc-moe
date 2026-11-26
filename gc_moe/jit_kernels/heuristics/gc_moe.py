@@ -7,6 +7,7 @@ from functools import lru_cache
 from math import ceil, sqrt
 from struct import pack, unpack
 
+from ...layout.direct_pull import get_direct_pull_cache_layout
 from ...layout.gc_moe import (
     CANDIDATE_BLOCK_M,
     COMBINE_WARPS,
@@ -219,15 +220,14 @@ def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, dir
     cfg = get_role_config(role, block_m, num_experts, hidden, local_experts=local_experts)
     if role != 2 or not direct_pull:
         return cfg
-    # Full small-M input cache, raw row-major X and SF, followed by one barrier.
-    cache_bytes = block_m // 2 * hidden + block_m * (hidden // 128) * 4 + 8
+    # Cache already has the MMA layout; include the last SF read guard.
     for stages in range(cfg.num_stages, 1, -1):
         layout = get_role_shared_layout(
             role, block_m, num_experts, cfg.pull_bytes, stages,
             store_m_l1=cfg.store_m_l1, store_m_l2=cfg.store_m_l2,
             dispatch_warps=cfg.routing_warps,
             block_n=128, block_k=128, sf_block_m=cfg.sf_block_m)
-        total = align(layout.field_end, 1024) + cache_bytes
+        total = get_direct_pull_cache_layout(layout.field_end, block_m, hidden).end
         if total <= SMEM_CAPACITY:
             return replace(cfg, num_stages=stages, dynamic_smem=total, shared_layout=layout)
     raise ValueError('direct-pull input cache leaves no space for two MMA stages')

@@ -164,7 +164,8 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
                      sf_block_m: cutlass.Constexpr,
                      shared_weight_gran_k: cutlass.Constexpr,
                      has_shared: cutlass.Constexpr,
-                     reuse_descriptors: cutlass.Constexpr) -> None:
+                     reuse_descriptors: cutlass.Constexpr,
+                     activation_sf_offset=None) -> None:
     """Issue the reference swapped-A/B 2CTA mixed MMA for one K128 stage.
 
     The caller has already completed the stage's TMA G2S and mbarrier wait.
@@ -180,12 +181,14 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
     # Only stage A/B descriptor bases are prepared in the full warp. The
     # reference computes SF addresses, SF selection and K32 descriptors in
     # the single elected issuer after the stage-full wait.
+    if cutlass.const_expr(activation_sf_offset is None):
+        activation_sf_offset = stage_idx * sf_block_m
     weight_start = weight_desc_start
     activation_start = activation_desc_start
 
     with cute.arch.elect_one():
         activation_sf_start = Uint32(
-            (Uint32((activation_sf_smem + stage_idx * sf_block_m).toint()) >>
+            (Uint32((activation_sf_smem + activation_sf_offset).toint()) >>
              Uint32(4)))
         activation_sf_desc = sf_desc_hi | Uint64(activation_sf_start)
         utccp_sf_4x32_2cta(activation_sf_desc, activation_sf_tmem)

@@ -1,0 +1,15 @@
+Device memcheck; exit status 0. CUDA API error reporting disabled.
+Filter: --kernel-name kns=kernel_cutlass_kernel_
+Options: --tool memcheck --report-api-errors no --print-limit 0 --target-processes all --error-exitcode 99
+CONFIG {'tokens': '4,32', 'hidden': 6144, 'intermediate': 2048, 'local_experts': 8, 'topk': 8, 'shared': 1, 'variants': 'll_direct', 'patterns': 'balanced,random,skew,empty,mixed', 'repeats': 1, 'graph_calls': 1, 'profile': False, 'output': 'results/ll/direct_memcheck_device.json'} EP 4
+CHECK 4 balanced ll_direct
+CHECK 4 random ll_direct
+CHECK 4 skew ll_direct
+CHECK 4 empty ll_direct
+CHECK 4 mixed ll_direct
+CHECK 32 balanced ll_direct
+CHECK 32 random ll_direct
+CHECK 32 skew ll_direct
+CHECK 32 empty ll_direct
+CHECK 32 mixed ll_direct
+========= ERROR SUMMARY: 0 errors

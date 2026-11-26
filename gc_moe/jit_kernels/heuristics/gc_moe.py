@@ -211,3 +211,23 @@ def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
     if scratch_bytes + COMBINE_WARPS * 8 > launch_bytes:
         raise ValueError('role3 compact combine allocation exceeds launch shared memory')
     return chunks, chunk_bytes, chunk_bytes // 512
+
+
+@lru_cache(maxsize=128)
+def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, direct_pull):
+    from dataclasses import replace
+    cfg = get_role_config(role, block_m, num_experts, hidden, local_experts=local_experts)
+    if role != 2 or not direct_pull:
+        return cfg
+    # Full small-M input cache, raw row-major X and SF, followed by one barrier.
+    cache_bytes = block_m // 2 * hidden + block_m * (hidden // 128) * 4 + 8
+    for stages in range(cfg.num_stages, 1, -1):
+        layout = get_role_shared_layout(
+            role, block_m, num_experts, cfg.pull_bytes, stages,
+            store_m_l1=cfg.store_m_l1, store_m_l2=cfg.store_m_l2,
+            dispatch_warps=cfg.routing_warps,
+            block_n=128, block_k=128, sf_block_m=cfg.sf_block_m)
+        total = align(layout.field_end, 1024) + cache_bytes
+        if total <= SMEM_CAPACITY:
+            return replace(cfg, num_stages=stages, dynamic_smem=total, shared_layout=layout)
+    raise ValueError('direct-pull input cache leaves no space for two MMA stages')

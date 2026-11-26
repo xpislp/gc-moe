@@ -281,29 +281,47 @@ class GreenContextPair:
     @_runtime_locked
     def __init__(self, device_index: int | None = None,
                  requested_dispatch_sms: int | None = None, *,
-                 num_ranks: int = 1):
+                 num_ranks: int = 1, low_latency: bool = False, ll_dispatch_sms: int = 1):
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         requested_dispatch_sms = _get_requested_dispatch_sms(
             num_ranks, requested_dispatch_sms)
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
-        self.primary_ctx_roles = _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0
+        ll_green = low_latency and _get_env_int('GC_MOE_LL_USE_GREEN', 0) != 0
+        self.primary_ctx_roles = ((low_latency and not ll_green) or
+                                  (not low_latency and _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0))
         if device_index is None:
             device_index = torch.cuda.current_device()
         self.device = _ok(cu.cuDeviceGet(device_index))
         green_resources = _green_resources()
-        total, compute, communication = green_resources.get_sm_split(
-            self.device, requested_dispatch_sms)
-        workqueue = None
-        if not self.primary_ctx_roles and _get_env_int('GC_MOE_BALANCED_WORKQUEUES', 1):
-            workqueue = green_resources.get_balanced_workqueue()
-        self.compute_sms = compute.sm.smCount
-        self.dispatch_sms = communication.sm.smCount
-        parts = () if self.primary_ctx_roles else (communication, compute)
-        if self.compute_sms < 32 or self.compute_sms % 2 or \
-                self.dispatch_sms <= 1 or self.compute_sms + self.dispatch_sms != total:
-            raise RuntimeError('unsupported Green SM partition')
+        if low_latency and not ll_green:
+            total = torch.cuda.get_device_properties(device_index).multi_processor_count
+            self.compute_sms = (total - max(2, ll_dispatch_sms)) // 2 * 2
+            self.dispatch_sms = ll_dispatch_sms
+            parts = ()
+            workqueue = None
+            if self.compute_sms < 2:
+                raise RuntimeError('LL requires at least four SMs')
+        else:
+            total, compute, communication = green_resources.get_sm_split(
+                self.device, requested_dispatch_sms)
+            workqueue = None
+            if not self.primary_ctx_roles and _get_env_int('GC_MOE_BALANCED_WORKQUEUES', 1):
+                workqueue = green_resources.get_balanced_workqueue()
+            self.compute_sms = compute.sm.smCount
+            self.dispatch_sms = communication.sm.smCount
+            parts = () if self.primary_ctx_roles else (communication, compute)
+            if self.compute_sms < 32 or self.compute_sms % 2 or \
+                    self.dispatch_sms <= 1 or self.compute_sms + self.dispatch_sms != total:
+                raise RuntimeError('unsupported Green SM partition')
+        if low_latency:
+            self.dispatch_sms = ll_dispatch_sms
+            requested_compute = _get_env_int('GC_MOE_LL_COMPUTE_SMS', 0)
+            if requested_compute:
+                if requested_compute < 2 or requested_compute % 2 or requested_compute > self.compute_sms:
+                    raise ValueError('LL compute grid must be even and within the available SM count')
+                self.compute_sms = requested_compute
         self.balanced_workqueues = workqueue is not None
         self.green = []
         self.contexts = []
@@ -529,7 +547,7 @@ class _ThreadContexts:
                 _pin_failed_pair(pair)
 
 
-def get_context(*, num_ranks: int) -> GreenContextPair:
+def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: int = 1) -> GreenContextPair:
     requested_dispatch_sms = _get_requested_dispatch_sms(num_ranks)
     current = _ok(cu.cuCtxGetCurrent())
     holder = getattr(_THREAD_LOCAL, 'holder', None)
@@ -538,10 +556,13 @@ def get_context(*, num_ranks: int) -> GreenContextPair:
     contexts = holder.contexts
     # Calls in different process groups may need different SM budgets even
     # on the same CUDA context. Reuse only the same effective SM request.
-    key = (int(current), requested_dispatch_sms)
+    key = (int(current), requested_dispatch_sms, low_latency, ll_dispatch_sms,
+           _get_env_int('GC_MOE_LL_USE_GREEN', 0) if low_latency else 0,
+           _get_env_int('GC_MOE_LL_COMPUTE_SMS', 0) if low_latency else 0)
     if key not in contexts or contexts[key]._state == 'closed':
         contexts[key] = GreenContextPair(
-            requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks)
+            requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks,
+            low_latency=low_latency, ll_dispatch_sms=ll_dispatch_sms)
     elif contexts[key]._state != 'open':
         raise RuntimeError(f"cached Green context pair is {contexts[key]._state}")
     return contexts[key]

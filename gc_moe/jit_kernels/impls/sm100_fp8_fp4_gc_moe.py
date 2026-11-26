@@ -40,6 +40,7 @@ from ...runtime.jit import (
 from ..heuristics.gc_moe import (
     get_combine_geometry,
     get_role_config,
+    get_ll_role_config,
     num_max_live_pool_blocks,
 )
 from .runtime_utils import (
@@ -553,7 +554,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                           l2_weights: tuple[torch.Tensor, torch.Tensor],
                           sym_buffer, shared_l1_weights=None,
                           shared_l2_weights=None, stats=None,
-                          context=None):
+                          context=None, *, low_latency=False, direct_pull=False):
     """Encode live maps once per pointer set and compile each role once/shape."""
     _check_supported(config, sym_buffer)
     small_tile_path = use_small_tile_path(config.shared_experts, config.block_m)
@@ -577,11 +578,16 @@ def prepare_role_binaries(config, y: torch.Tensor,
     compiler_identity = _compiler_identity(compiler_target)
     nvlink_timeout_secs = _get_gc_moe_nvlink_barrier_timeout_secs()
     routed_weight_linger = _routed_weight_linger(config, sym_buffer.num_topk)
-    role_configs = tuple(get_role_config(role, config.block_m,
-                                         sym_buffer.num_experts,
-                                         config.hidden,
-                                         local_experts=config.local_experts)
-                         for role in (1, 2, 3))
+    if low_latency:
+        role_configs = tuple(get_ll_role_config(role, config.block_m,
+            sym_buffer.num_experts, config.hidden, local_experts=config.local_experts,
+            direct_pull=direct_pull) for role in (1, 2, 3))
+    else:
+        role_configs = tuple(get_role_config(role, config.block_m,
+                                             sym_buffer.num_experts,
+                                             config.hidden,
+                                             local_experts=config.local_experts)
+                             for role in (1, 2, 3))
     role_resources = tuple((item.num_stages, item.dynamic_smem, item.threads)
                            for item in role_configs)
     role3_config = role_configs[2]
@@ -601,6 +607,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                        nvlink_timeout_secs, routed_weight_linger,
                        role_resources, combine_resources,
                        compiler_identity)
+    l1_group = int(os.environ.get('GC_MOE_LL_L1_GROUP', '2')) if low_latency and direct_pull else 1
+    if l1_group not in (1, 2, 4, 8):
+        raise ValueError('GC_MOE_LL_L1_GROUP must be 1, 2, 4 or 8')
+    key = (key, low_latency, direct_pull, l1_group)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -641,6 +651,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         has_stats=stats is not None,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         routed_weight_linger=routed_weight_linger,
+                        low_latency=low_latency, direct_pull=direct_pull, l1_group=l1_group,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)
@@ -724,4 +735,17 @@ def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights, stats, context)
+    context.launch(binaries, arguments)
+
+
+def launch_gc_moe_ll(config, y, l1_weights, l2_weights, sym_buffer,
+                     shared_l1_weights, shared_l2_weights, stats, *, direct_pull=True):
+    route_grid = 1 if direct_pull else next(
+        n for n in (8, 4, 2, 1) if config.local_experts % n == 0)
+    context = get_context(num_ranks=sym_buffer.group.size(), low_latency=True,
+                          ll_dispatch_sms=route_grid)
+    binaries, arguments = prepare_role_binaries(
+        config, y, l1_weights, l2_weights, sym_buffer,
+        shared_l1_weights, shared_l2_weights, stats, context,
+        low_latency=True, direct_pull=direct_pull)
     context.launch(binaries, arguments)

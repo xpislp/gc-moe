@@ -215,6 +215,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    local_experts: cutlass.Constexpr,
                    num_ranks: cutlass.Constexpr,
                    shared_experts: cutlass.Constexpr,
+                   l1_group: cutlass.Constexpr = 1,
 ) -> None:
     """Publish shared and interleaved routed tasks, then the end sentinel."""
     shared_m_blocks = (num_tokens + Uint32(block_m - 1)) // \
@@ -266,16 +267,17 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
     # issued before the first L2 wave, then one L1 follows each
     # successful L2 claim until the L1 queue is exhausted.
     num_clusters = compute_sms // 2
+    l1_tasks = (l1_clusters + l1_group - 1) // l1_group
     first_l2_m_blocks = (num_clusters + l2_clusters - 1) // l2_clusters
-    first_l2_warmup = (first_l2_m_blocks * l1_clusters +
+    first_l2_warmup = (first_l2_m_blocks * l1_tasks +
                        num_clusters - 1) // num_clusters
-    interleave_diff = max(l1_clusters - l2_clusters, 0)
+    interleave_diff = max(l1_tasks - l2_clusters, 0)
     l1_warmup = Uint32(0)
     if routed_m_blocks > 0:
-        interleave_warmup = (l1_clusters +
+        interleave_warmup = (l1_tasks +
                              (routed_m_blocks - 1) * interleave_diff +
                              num_clusters - 1) // num_clusters + 1
-        total_l1_waves = (routed_m_blocks * l1_clusters +
+        total_l1_waves = (routed_m_blocks * l1_tasks +
                           num_clusters - 1) // num_clusters
         l1_warmup = min(total_l1_waves,
                         max(Uint32(first_l2_warmup), interleave_warmup))
@@ -288,20 +290,24 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
             if l1_warmup != l1_done and l1_warmup > 0:
                 l1_warmup -= Uint32(1)
                 task_idx = claim_task(l1_count_ptr, Int32(lane))
-                if task_idx >= routed_m_blocks * l1_clusters:
+                if task_idx >= routed_m_blocks * l1_tasks:
                     l1_warmup = l1_done
                 else:
-                    pool_block = task_idx // l1_clusters
-                    n_cluster = task_idx % l1_clusters
+                    pool_block = task_idx // l1_tasks
+                    n_cluster = (task_idx % l1_tasks) * Uint32(l1_group)
                     local_expert, m_block, valid_m = \
                         locate_routed_pool_block(
                             expert_counts, pool_block, Uint32(lane),
                             local_experts, block_m)
-                    publish_iteration(task, full, iteration, Int32(lane),
-                                      Uint32(GCBlockPhase.Linear1), local_expert,
-                                      m_block, n_cluster, pool_block, valid_m,
-                                      Uint32(2 * intermediate), Uint32(hidden))
-                    iteration = Uint32(iteration + Uint32(1))
+                    for offset in cutlass.range_constexpr(l1_group):
+                        if n_cluster + Uint32(offset) < Uint32(l1_clusters):
+                            if cutlass.const_expr(offset > 0):
+                                wait_task_slot(empty, iteration)
+                            publish_iteration(task, full, iteration, Int32(lane),
+                                              Uint32(GCBlockPhase.Linear1), local_expert,
+                                              m_block, n_cluster + Uint32(offset), pool_block, valid_m,
+                                              Uint32(2 * intermediate), Uint32(hidden))
+                            iteration = Uint32(iteration + Uint32(1))
                     fetching = False
             else:
                 task_idx = claim_task(l2_count_ptr, Int32(lane))
@@ -317,7 +323,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                         locate_routed_pool_block(
                             expert_counts, pool_block, Uint32(lane),
                             local_experts, block_m)
-                    required_l1 = (pool_block + 1) * l1_clusters
+                    required_l1 = (pool_block + 1) * l1_tasks
                     while ld_volatile_u32(l1_count_ptr) < required_l1:
                         pass
                     publish_iteration(task, full, iteration, Int32(lane),

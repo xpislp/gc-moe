@@ -12,6 +12,17 @@ weights and BF16 outputs.
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
 it does not compile CUDA kernels.
 
+## SM100 small-batch path
+
+`fp8_fp4_gc_moe_ll` specializes T/rank ≤ 32 with expert-owned routing,
+primary-context worker kernels and a smaller finalize grid. It reuses the
+GC buffer/weight contract; use `get_block_m_for_gc_moe_ll` when staging
+shared input scales. An explicit `direct_pull=True` enables the experimental
+compute-CTA input cache, which was slower on the tested EP4 GLM5.2 shapes.
+See the [implementation, correctness and EP4 benchmark report](docs/sm100_gc_moe_ll.md).
+EP4 preserves eight routed experts per GPU; these measurements do not establish
+EP32 or multi-node latency.
+
 ## Performance
 
 Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight

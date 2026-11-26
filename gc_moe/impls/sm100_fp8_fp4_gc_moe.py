@@ -30,6 +30,8 @@ from ..common.math import (
     warp_group4_max,
 )
 from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
+from ..common.direct_pull import cache_peer_tile, load_cached_k128
+from ..common.ll_routes import materialize_routes
 from ..layout.gc_moe import (
     ACCUM_BARRIER_STAGES,
     COMBINE_WARPS,
@@ -271,7 +273,8 @@ class GCMoERoleKernel:
                  has_stats: bool = False,
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, combine_geometry: tuple[int, int, int] | None = None,
-                 routed_weight_linger: bool = False):
+                 routed_weight_linger: bool = False,
+                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -287,8 +290,14 @@ class GCMoERoleKernel:
             raise ValueError('GC math pipeline needs 2..32 TMA stages')
         if not 0 < nvlink_timeout_secs <= 2_147_483_647:
             raise ValueError('NVLink barrier timeout must fit positive INT_MAX seconds')
+        self.l1_group = l1_group
+        self.low_latency = low_latency
+        self.direct_pull = direct_pull
+        if low_latency and (local_experts % dispatch_sms or num_tokens > 32):
+            raise ValueError("LL route grid must divide local experts and T <= 32")
         self.role = role
         self.dispatch_sms = dispatch_sms
+        self.route_publishers = 1 if low_latency else dispatch_sms
         self.compute_sms = compute_sms
         self.block_m = block_m
         self.num_tokens = num_tokens
@@ -360,7 +369,15 @@ class GCMoERoleKernel:
                     min(compute_sms, local_experts + 1),
                     (num_tokens * self.combine_chunks + (COMBINE_WARPS - 1)) //
                     COMBINE_WARPS))
+        if low_latency and role == 3 and finalize_output:
+            self.finalize_sms = min(compute_sms, max(8,
+                (num_tokens * self.combine_chunks + COMBINE_WARPS - 1) // COMBINE_WARPS))
         self.shared_layout = role_config.shared_layout
+        self.ll_cache_offset = (self.shared_layout.field_end + 1023) // 1024 * 1024
+        self.ll_sf_offset = self.ll_cache_offset + block_m // 2 * hidden
+        self.ll_bar_offset = self.ll_sf_offset + block_m * (hidden // 128) * 4
+        self.smem_bytes = (self.ll_bar_offset + 8 if direct_pull and role == 2
+                           else self.shared_layout.field_end)
         layout = GCBufferLayout(num_ranks, num_ranks * local_experts, capacity, topk,
                                 hidden, intermediate, ring_tokens, sf_ring_tokens,
                                 shared_experts)
@@ -431,6 +448,10 @@ class GCMoERoleKernel:
             # math_stages <= 32 bound keeps all stages within one warp.
             if cutlass.const_expr(self.role == 2):
                 cta_rank, _, _ = cute.arch.block_in_cluster_idx()
+                if cutlass.const_expr(self.direct_pull):
+                    if lane == 0:
+                        cute.arch.mbarrier_init(cute.recast_ptr(
+                            slab + self.ll_bar_offset, dtype=Uint64), 1)
                 data_full = cute.recast_ptr(slab + self.shared_layout.data_full, dtype=Uint64)
                 data_empty = cute.recast_ptr(slab + self.shared_layout.data_empty, dtype=Uint64)
                 if lane < self.math_stages:
@@ -710,14 +731,15 @@ class GCMoERoleKernel:
         lane = tid % 32
 
         if cutlass.const_expr(self.role == 1):
-            # First count local routes, reserve a distinct source-index span,
-            # then publish the receive count only after writing that span.
+            # Throughput: count, reserve, then write each CTA's source span.
+            # LL: each expert has one owning CTA, which assigns source slots
+            # during its only scan. Publish only after source writes complete.
             # Route each global expert to its owner rank and local expert.
             # Each local expert has an independent receive count and a padded
             # pool-block prefix; ring slots remain shared by all experts.
             dispatch_smem = cutlass.utils.SmemAllocator()
             slab = cute.recast_ptr(
-                dispatch_smem.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
+                dispatch_smem.allocate(self.smem_bytes, 1024), dtype=Uint8)
             expert_token_count = cute.recast_ptr(
                 slab + self.shared_layout.expert_counts, dtype=Uint32)
             pull = cute.recast_ptr(slab + self.shared_layout.pull, dtype=Uint32)
@@ -774,6 +796,33 @@ class GCMoERoleKernel:
             route_base = Uint32((block * self.dispatch_warps + physical_warp) *
                                 tokens_per_warp)
             route_stride = self.dispatch_sms * self.dispatch_warps * tokens_per_warp
+            if cutlass.const_expr(self.low_latency):
+                route_base = Uint32(physical_warp * tokens_per_warp)
+                route_stride = self.dispatch_warps * tokens_per_warp
+            if cutlass.const_expr(not self.low_latency):
+                for route_iter in cutlass.range(
+                        route_base, num_tokens, route_stride, unroll_full=True):
+                    route_base = Uint32(route_iter)
+                    route_token = route_base + Uint32(lane // self.topk)
+                    token_topk = route_base * Uint32(self.topk) + Uint32(lane)
+                    if lane < active_route_lanes and route_token < num_tokens:
+                        expert = routes[token_topk]
+                        if expert < Uint64(self.num_ranks * self.local_experts):
+                            atom_shared_add_u32(expert_token_count + Uint32(expert),
+                                                Uint32(1))
+                    cute.arch.sync_warp()
+                cute.arch.sync_threads()
+                for expert_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    expert_idx = Uint32(expert_iter)
+                    old_send = atom_add_u64(
+                        send_ptr + expert_idx * Uint32(2),
+                        (Uint64(1) << 32) | Uint64(expert_token_count[expert_idx]))
+                    expert_token_count[expert_idx] = Uint32(old_send)
+                cute.arch.sync_threads()
+                route_base = Uint32((block * self.dispatch_warps + physical_warp) *
+                                    tokens_per_warp)
             for route_iter in cutlass.range(
                     route_base, num_tokens, route_stride, unroll_full=True):
                 route_base = Uint32(route_iter)
@@ -781,30 +830,8 @@ class GCMoERoleKernel:
                 token_topk = route_base * Uint32(self.topk) + Uint32(lane)
                 if lane < active_route_lanes and route_token < num_tokens:
                     expert = routes[token_topk]
-                    if expert < Uint64(self.num_ranks * self.local_experts):
-                        atom_shared_add_u32(expert_token_count + Uint32(expert),
-                                            Uint32(1))
-                cute.arch.sync_warp()
-            cute.arch.sync_threads()
-            for expert_iter in cutlass.range(
-                    Uint32(tid), Uint32(self.num_ranks * self.local_experts),
-                    self.dispatch_warps * 32, unroll_full=True):
-                expert_idx = Uint32(expert_iter)
-                old_send = atom_add_u64(
-                    send_ptr + expert_idx * Uint32(2),
-                    (Uint64(1) << 32) | Uint64(expert_token_count[expert_idx]))
-                expert_token_count[expert_idx] = Uint32(old_send)
-            cute.arch.sync_threads()
-            route_base = Uint32((block * self.dispatch_warps + physical_warp) *
-                                tokens_per_warp)
-            for route_iter in cutlass.range(
-                    route_base, num_tokens, route_stride, unroll_full=True):
-                route_base = Uint32(route_iter)
-                route_token = route_base + Uint32(lane // self.topk)
-                token_topk = route_base * Uint32(self.topk) + Uint32(lane)
-                if lane < active_route_lanes and route_token < num_tokens:
-                    expert = routes[token_topk]
-                    if expert < Uint64(self.num_ranks * self.local_experts):
+                    if expert < Uint64(self.num_ranks * self.local_experts) and (
+                            not self.low_latency or Uint32(expert) % Uint32(self.dispatch_sms) == Uint32(block)):
                         dst_rank = Uint32(expert) // Uint32(self.local_experts)
                         dst_local = Uint32(expert) % Uint32(self.local_experts)
                         slot = atom_shared_add_u32(
@@ -818,18 +845,29 @@ class GCMoERoleKernel:
                                    Uint32(4)), cute.AddressSpace.gmem)
                         dst_index[0] = token_topk
                 cute.arch.sync_warp()
-            grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
-            if block == 0:
+            if cutlass.const_expr(self.low_latency and self.dispatch_sms == 1):
+                cute.arch.sync_threads()
+            else:
+                grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
+            publish_start = Uint32(tid)
+            publish_stride = self.dispatch_warps * 32
+            if cutlass.const_expr(self.low_latency):
+                publish_start = Uint32(tid) * Uint32(self.dispatch_sms) + Uint32(block)
+                publish_stride = self.dispatch_warps * 32 * self.dispatch_sms
+            if block == 0 or self.low_latency:
                 for expert_iter in cutlass.range(
-                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
-                        self.dispatch_warps * 32, unroll_full=True):
+                        publish_start, Uint32(self.num_ranks * self.local_experts),
+                        publish_stride, unroll_full=True):
                     expert_idx = Uint32(expert_iter)
                     dst_rank = expert_idx // Uint32(self.local_experts)
                     dst_local = expert_idx % Uint32(self.local_experts)
                     dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
-                    status = ld_global_u64(
-                        signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
-                        expert_idx * Uint32(2))
+                    if cutlass.const_expr(self.low_latency):
+                        status = (Uint64(1) << 32) | Uint64(expert_token_count[expert_idx])
+                    else:
+                        status = ld_global_u64(
+                            signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
+                            expert_idx * Uint32(2))
                     remote_count = cute.make_ptr(
                         Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count']) +
                         Uint64(gen * Uint32(self.num_ranks * self.local_experts * 8)) +
@@ -843,15 +881,18 @@ class GCMoERoleKernel:
                 cute.arch.sync_threads()
                 fence_acq_rel_sys()
                 for expert_iter in cutlass.range(
-                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
-                        self.dispatch_warps * 32, unroll_full=True):
+                        publish_start, Uint32(self.num_ranks * self.local_experts),
+                        publish_stride, unroll_full=True):
                     expert_idx = Uint32(expert_iter)
                     dst_rank = expert_idx // Uint32(self.local_experts)
                     dst_local = expert_idx % Uint32(self.local_experts)
                     dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
-                    status = ld_global_u64(
-                        signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
-                        expert_idx * Uint32(2))
+                    if cutlass.const_expr(self.low_latency):
+                        status = (Uint64(1) << 32) | Uint64(expert_token_count[expert_idx])
+                    else:
+                        status = ld_global_u64(
+                            signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
+                            expert_idx * Uint32(2))
                     remote_sum = cute.make_ptr(
                         Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count_sum']) +
                         Uint64(gen * Uint32(self.local_experts * 8)) +
@@ -874,7 +915,7 @@ class GCMoERoleKernel:
                 if expert_idx < Uint32(self.local_experts):
                     wait_start = read_clock64()
                     while Uint32(observed >> 32) != Uint32(
-                            self.dispatch_sms * self.num_ranks):
+                            self.route_publishers * self.num_ranks):
                         observed = ld_volatile_u64(
                             recv_ptr + expert_idx * Uint32(2))
                         if Uint64(read_clock64() - wait_start) >= Uint64(
@@ -883,7 +924,7 @@ class GCMoERoleKernel:
                                 cute.printf(
                                     'GC recv-count timeout role=1 rank={} expert={} gen={} observed_hi={} expected={}',
                                     rank_idx, expert_idx, gen, Uint32(observed >> 32),
-                                    self.dispatch_sms * self.num_ranks)
+                                    self.route_publishers * self.num_ranks)
                             device_trap()
                     observed = ld_acquire_sys_u64(
                         recv_ptr + expert_idx * Uint32(2))
@@ -900,211 +941,223 @@ class GCMoERoleKernel:
                 if lane == Uint32(0):
                     signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4] = total_pool_blocks
 
-            # One global warp cursor traverses concatenated, unpadded expert
-            # tokens; the pool-block prefix advances by each expert's padded
-            # M-block count. Only the TMA and final L1 release elect a lane.
-            token_idx = Uint32(block) * Uint32(self.dispatch_warps) + Uint32(physical_warp)
-            current_expert = Int32(-1)
-            expert_start = Uint32(0)
-            expert_end = Uint32(0)
-            pool_block_offset = Uint32(0)
-            pull_phase = Uint32(0)
-            rank_waves = (self.num_ranks + 31) // 32
-            current_expert, expert_start, expert_end, pool_block_offset = \
-                advance_expert(
-                    expert_counts, token_idx, current_expert, expert_start,
-                    expert_end, pool_block_offset, lane, self.local_experts,
-                    self.block_m)
-            while current_expert < Int32(self.local_experts):
-                received = expert_end - expert_start
-                pull_token = token_idx - expert_start
-                pool_block = pool_block_offset + pull_token // self.block_m
-                pool_token = pool_block * Uint32(self.block_m) + pull_token % Uint32(self.block_m)
-                ring_block = pool_block % self.ring_blocks
-                generation = pool_block // self.ring_blocks
-
-                # Each lane owns one source rank in each 32-rank wave.
-                # Reduce across its register waves before the warp reduction.
-                remaining = cute.make_rmem_tensor((rank_waves,), Uint32)
-                # Reload per token to isolate the immutable source count from
-                # the destructively peeled loop-carried remainder.
-                for wave in cutlass.range_constexpr(rank_waves):
-                    source_rank = Uint32(wave * 32) + lane
-                    remaining[wave] = Uint32(0)
-                    if source_rank < Uint32(self.num_ranks):
-                        count_ptr = signals.iterator + \
-                            SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
-                            gen * Uint32(self.num_ranks * self.local_experts * 2) + \
-                            (source_rank * Uint32(self.local_experts) +
-                             Uint32(current_expert)) * Uint32(2)
-                        remaining[wave] = Uint32(
-                            ld_global_u64(count_ptr))
-                src_rank = Uint32(0)
-                src_slot = Uint32(0)
-                if cutlass.const_expr(self.num_ranks <= 8):
-                    # Concatenate source-rank intervals without changing the
-                    # source-index payload or its output metadata encoding.
-                    prefix = Uint32(0)
-                    for source_rank in cutlass.range_constexpr(self.num_ranks):
-                        count = cute.arch.shuffle_sync(remaining[0], source_rank)
-                        if pull_token >= prefix and pull_token < prefix + count:
-                            src_rank = Uint32(source_rank)
-                            src_slot = pull_token - prefix
-                        prefix += count
-                else:
-                    peel_slot = Uint32(pull_token)
-                    peel_offset = Uint32(0)
-                    selected = False
-                    while not selected:
-                        lane_active = Uint32(0)
-                        lane_minimum = Uint32(0xffffffff)
-                        for wave in cutlass.range_constexpr(rank_waves):
-                            count = remaining[wave]
-                            lane_active += Uint32(1) if count > Uint32(0) else Uint32(0)
-                            if count > Uint32(0):
-                                lane_minimum = min(lane_minimum, count)
-                        active = cute.arch.warp_redux_sync(lane_active, 'add')
-                        minimum = cute.arch.warp_redux_sync(lane_minimum, 'min')
-                        round_tokens = active * minimum
-                        if peel_slot < round_tokens:
-                            position = peel_slot % active
-                            seen = Uint32(0)
-                            for wave in cutlass.range_constexpr(rank_waves):
-                                mask = Uint32(cute.arch.vote_ballot_sync(
-                                    remaining[wave] > Uint32(0)))
-                                wave_active = Uint32(cute.arch.popc(mask))
-                                if position >= seen and position < seen + wave_active:
-                                    src_rank = Uint32(wave * 32) + warp_nth_set_bit(
-                                        mask, position - seen + Uint32(1))
-                                seen += wave_active
-                            src_slot = peel_offset + peel_slot // active
-                            selected = True
-                        else:
-                            peel_slot -= round_tokens
-                            peel_offset += minimum
-                            for wave in cutlass.range_constexpr(rank_waves):
-                                remaining[wave] -= min(remaining[wave], minimum)
-                token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
-                                         src_rank) * Uint32(self.capacity) + src_slot]
-                src_token = token_topk // Uint32(self.topk)
-                topk_slot = token_topk % Uint32(self.topk)
-                if generation > 0:
-                    empty_ptr = signals.iterator + \
-                        SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block
-                    target = generation * (2 * self.intermediate // 128)
-                    while ld_acquire_gpu_u32(empty_ptr) < target:
-                        pass
-                src_base = mapped_peer_base(peer_ptrs, src_rank, self.num_ranks)
-                src_x = cute.make_ptr(
-                    Uint32, src_base + Uint64(self.input_x_words * 4) +
-                    Uint64(src_token) * Uint64(self.hidden),
-                    cute.AddressSpace.gmem, assumed_align=16)
-                dst_x = cute.recast_ptr(
-                    cute.recast_ptr(signals.iterator, dtype=Uint8) +
-                    Uint64(self.l1_x_words) * Uint64(4) +
-                    Uint64(pool_token % self.ring_tokens) * Uint64(self.hidden),
-                    dtype=Uint32)
-                warp_pull = pull + physical_warp * (self.pull_bytes // 4)
-                warp_bar = pull_bar + physical_warp
-                if elect_one_sync():
-                    for chunk in cutlass.range_constexpr(self.pull_chunks):
-                        byte_words = chunk * (self.pull_bytes // 4)
-                        bulk_g2s_1d(warp_pull, src_x + byte_words,
-                                     Uint32(self.pull_bytes), warp_bar)
-                        cute.arch.mbarrier_arrive_and_expect_tx(warp_bar, self.pull_bytes)
-                        if chunk + 1 < self.pull_chunks:
-                            cute.arch.mbarrier_wait(warp_bar, pull_phase)
-                            pull_phase ^= Uint32(1)
-                            bulk_s2g_1d(dst_x + byte_words, warp_pull,
-                                         Uint32(self.pull_bytes))
-                            cute.arch.cp_async_bulk_commit_group()
-                            cute.arch.cp_async_bulk_wait_group(0)
-                cute.arch.sync_warp()
-
-                sf_row = ring_block * ((self.block_m + 127) // 128 * 128) + \
-                    ((pull_token % self.block_m) & ~127) + \
-                    ((pull_token % self.block_m) & 31) * 4 + \
-                    (((pull_token % self.block_m) >> 5) & 3)
-                remote_sf_base = src_base + Uint64(self.input_sf_words * 4) + \
-                    Uint64(src_token) * Uint64(self.hidden // 128 * 4)
-                remote_weight = cute.make_ptr(
-                    Uint32, src_base + Uint64(self.input_weight_words * 4) +
-                    Uint64(token_topk) * Uint64(4), cute.AddressSpace.gmem)
-                weight = remote_weight[0]
-                if cutlass.const_expr((self.hidden // 128) % 4 == 0):
-                    sf_vectors = self.hidden // 512
-                    for q_round in cutlass.range(
-                            (sf_vectors + 31) // 32, unroll_full=True):
-                        q = q_round * 32 + lane
-                        if q < sf_vectors:
-                            remote_vec = cute.make_ptr(
-                                Uint32, remote_sf_base + Uint64(q * Uint32(16)),
-                                cute.AddressSpace.gmem, assumed_align=16)
-                            values = ld_global_u32x4(remote_vec)
-                            for component in cutlass.range_constexpr(4):
-                                sf_col = q * 4 + component
-                                if cutlass.const_expr(self.wide_l1_sf):
-                                    l1_sf_bytes = cute.recast_ptr(
-                                        signals.iterator, dtype=Uint8) + \
-                                        Uint64(self.l1_sf_words) * Uint64(4)
-                                    sf_word = Uint64(sf_col) * \
-                                        Uint64(self.sf_ring_tokens) + Uint64(sf_row)
-                                    cute.recast_ptr(
-                                        l1_sf_bytes + sf_word * Uint64(4),
-                                        dtype=Uint32)[0] = values[component]
-                                else:
-                                    signals[self.l1_sf_words +
-                                            sf_col * self.sf_ring_tokens + sf_row] = \
-                                        values[component]
-                else:
-                    for sf_round in cutlass.range(
-                            (self.hidden // 128 + 31) // 32, unroll_full=True):
-                        sf_col = sf_round * 32 + lane
-                        if sf_col < self.hidden // 128:
-                            remote_word = cute.make_ptr(
-                                Uint32, remote_sf_base + Uint64(sf_col * Uint32(4)),
-                                cute.AddressSpace.gmem, assumed_align=4)
-                            if cutlass.const_expr(self.wide_l1_sf):
-                                l1_sf_bytes = cute.recast_ptr(
-                                    signals.iterator, dtype=Uint8) + \
-                                    Uint64(self.l1_sf_words) * Uint64(4)
-                                sf_word = Uint64(sf_col) * \
-                                    Uint64(self.sf_ring_tokens) + Uint64(sf_row)
-                                cute.recast_ptr(
-                                    l1_sf_bytes + sf_word * Uint64(4),
-                                    dtype=Uint32)[0] = remote_word[0]
-                            else:
-                                signals[self.l1_sf_words +
-                                        sf_col * self.sf_ring_tokens + sf_row] = \
-                                    remote_word[0]
-                cute.arch.sync_warp()
-                if elect_one_sync():
-                    signals[self.l1_weight_words + pool_token % self.ring_tokens] = weight
-                    signals[self.metadata_words + pool_token * 3] = src_rank
-                    signals[self.metadata_words + pool_token * 3 + 1] = src_token
-                    signals[self.metadata_words + pool_token * 3 + 2] = topk_slot
-                    # The last remote G2S overlapped weight/SF work. Drain
-                    # it, store the chunk, then publish W1 after S2G finishes.
-                    cute.arch.mbarrier_wait(warp_bar, pull_phase)
-                    pull_phase ^= Uint32(1)
-                    final_byte_words = (self.pull_chunks - 1) * (self.pull_bytes // 4)
-                    bulk_s2g_1d(dst_x + final_byte_words, warp_pull,
-                                 Uint32(self.pull_bytes))
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0)
-                    is_last_token = token_idx == expert_end - Uint32(1)
-                    full_increment = Uint32(self.block_m) - (pull_token % self.block_m) \
-                        if is_last_token else Uint32(1)
-                    red_release_gpu_add_u32(
-                        signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block,
-                        Uint32(full_increment))
-                cute.arch.sync_warp()
-                token_idx += Uint32(self.dispatch_sms * self.dispatch_warps)
+            if cutlass.const_expr(self.direct_pull):
+                materialize_routes(
+                    signals, peer_ptrs, source_idx, expert_counts, gen,
+                    Uint32(physical_warp), Uint32(lane), self.local_experts,
+                    self.num_ranks, self.capacity, self.topk, self.block_m,
+                    self.dispatch_warps, self.ring_blocks, self.ring_tokens,
+                    self.intermediate, self.metadata_words, self.l1_weight_words,
+                    self.input_weight_words)
+            else:
+                # One global warp cursor traverses concatenated, unpadded expert
+                # tokens; the pool-block prefix advances by each expert's padded
+                # M-block count. Only the TMA and final L1 release elect a lane.
+                token_idx = Uint32(block) * Uint32(self.dispatch_warps) + Uint32(physical_warp)
+                current_expert = Int32(-1)
+                expert_start = Uint32(0)
+                expert_end = Uint32(0)
+                pool_block_offset = Uint32(0)
+                pull_phase = Uint32(0)
+                rank_waves = (self.num_ranks + 31) // 32
                 current_expert, expert_start, expert_end, pool_block_offset = \
                     advance_expert(
                         expert_counts, token_idx, current_expert, expert_start,
                         expert_end, pool_block_offset, lane, self.local_experts,
                         self.block_m)
+                while current_expert < Int32(self.local_experts):
+                    received = expert_end - expert_start
+                    pull_token = token_idx - expert_start
+                    pool_block = pool_block_offset + pull_token // self.block_m
+                    pool_token = pool_block * Uint32(self.block_m) + pull_token % Uint32(self.block_m)
+                    ring_block = pool_block % self.ring_blocks
+                    generation = pool_block // self.ring_blocks
+
+                    # Each lane owns one source rank in each 32-rank wave.
+                    # Reduce across its register waves before the warp reduction.
+                    remaining = cute.make_rmem_tensor((rank_waves,), Uint32)
+                    # Reload per token to isolate the immutable source count from
+                    # the destructively peeled loop-carried remainder.
+                    for wave in cutlass.range_constexpr(rank_waves):
+                        source_rank = Uint32(wave * 32) + lane
+                        remaining[wave] = Uint32(0)
+                        if source_rank < Uint32(self.num_ranks):
+                            count_ptr = signals.iterator + \
+                                SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                                gen * Uint32(self.num_ranks * self.local_experts * 2) + \
+                                (source_rank * Uint32(self.local_experts) +
+                                 Uint32(current_expert)) * Uint32(2)
+                            remaining[wave] = Uint32(
+                                ld_global_u64(count_ptr))
+                    src_rank = Uint32(0)
+                    src_slot = Uint32(0)
+                    if cutlass.const_expr(self.num_ranks <= 8):
+                        # Concatenate source-rank intervals without changing the
+                        # source-index payload or its output metadata encoding.
+                        prefix = Uint32(0)
+                        for source_rank in cutlass.range_constexpr(self.num_ranks):
+                            count = cute.arch.shuffle_sync(remaining[0], source_rank)
+                            if pull_token >= prefix and pull_token < prefix + count:
+                                src_rank = Uint32(source_rank)
+                                src_slot = pull_token - prefix
+                            prefix += count
+                    else:
+                        peel_slot = Uint32(pull_token)
+                        peel_offset = Uint32(0)
+                        selected = False
+                        while not selected:
+                            lane_active = Uint32(0)
+                            lane_minimum = Uint32(0xffffffff)
+                            for wave in cutlass.range_constexpr(rank_waves):
+                                count = remaining[wave]
+                                lane_active += Uint32(1) if count > Uint32(0) else Uint32(0)
+                                if count > Uint32(0):
+                                    lane_minimum = min(lane_minimum, count)
+                            active = cute.arch.warp_redux_sync(lane_active, 'add')
+                            minimum = cute.arch.warp_redux_sync(lane_minimum, 'min')
+                            round_tokens = active * minimum
+                            if peel_slot < round_tokens:
+                                position = peel_slot % active
+                                seen = Uint32(0)
+                                for wave in cutlass.range_constexpr(rank_waves):
+                                    mask = Uint32(cute.arch.vote_ballot_sync(
+                                        remaining[wave] > Uint32(0)))
+                                    wave_active = Uint32(cute.arch.popc(mask))
+                                    if position >= seen and position < seen + wave_active:
+                                        src_rank = Uint32(wave * 32) + warp_nth_set_bit(
+                                            mask, position - seen + Uint32(1))
+                                    seen += wave_active
+                                src_slot = peel_offset + peel_slot // active
+                                selected = True
+                            else:
+                                peel_slot -= round_tokens
+                                peel_offset += minimum
+                                for wave in cutlass.range_constexpr(rank_waves):
+                                    remaining[wave] -= min(remaining[wave], minimum)
+                    token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
+                                             src_rank) * Uint32(self.capacity) + src_slot]
+                    src_token = token_topk // Uint32(self.topk)
+                    topk_slot = token_topk % Uint32(self.topk)
+                    if generation > 0:
+                        empty_ptr = signals.iterator + \
+                            SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block
+                        target = generation * (2 * self.intermediate // 128)
+                        while ld_acquire_gpu_u32(empty_ptr) < target:
+                            pass
+                    src_base = mapped_peer_base(peer_ptrs, src_rank, self.num_ranks)
+                    if cutlass.const_expr(not self.direct_pull):
+                        src_x = cute.make_ptr(
+                            Uint32, src_base + Uint64(self.input_x_words * 4) +
+                            Uint64(src_token) * Uint64(self.hidden),
+                            cute.AddressSpace.gmem, assumed_align=16)
+                        dst_x = cute.recast_ptr(
+                            cute.recast_ptr(signals.iterator, dtype=Uint8) +
+                            Uint64(self.l1_x_words) * Uint64(4) +
+                            Uint64(pool_token % self.ring_tokens) * Uint64(self.hidden),
+                            dtype=Uint32)
+                        warp_pull = pull + physical_warp * (self.pull_bytes // 4)
+                        warp_bar = pull_bar + physical_warp
+                        if elect_one_sync():
+                            for chunk in cutlass.range_constexpr(self.pull_chunks):
+                                byte_words = chunk * (self.pull_bytes // 4)
+                                bulk_g2s_1d(warp_pull, src_x + byte_words,
+                                             Uint32(self.pull_bytes), warp_bar)
+                                cute.arch.mbarrier_arrive_and_expect_tx(warp_bar, self.pull_bytes)
+                                if chunk + 1 < self.pull_chunks:
+                                    cute.arch.mbarrier_wait(warp_bar, pull_phase)
+                                    pull_phase ^= Uint32(1)
+                                    bulk_s2g_1d(dst_x + byte_words, warp_pull,
+                                                 Uint32(self.pull_bytes))
+                                    cute.arch.cp_async_bulk_commit_group()
+                                    cute.arch.cp_async_bulk_wait_group(0)
+                        cute.arch.sync_warp()
+
+                        sf_row = ring_block * ((self.block_m + 127) // 128 * 128) + \
+                            ((pull_token % self.block_m) & ~127) + \
+                            ((pull_token % self.block_m) & 31) * 4 + \
+                            (((pull_token % self.block_m) >> 5) & 3)
+                        remote_sf_base = src_base + Uint64(self.input_sf_words * 4) + \
+                            Uint64(src_token) * Uint64(self.hidden // 128 * 4)
+                    remote_weight = cute.make_ptr(
+                        Uint32, src_base + Uint64(self.input_weight_words * 4) +
+                        Uint64(token_topk) * Uint64(4), cute.AddressSpace.gmem)
+                    weight = remote_weight[0]
+                    if cutlass.const_expr(not self.direct_pull):
+                        if cutlass.const_expr((self.hidden // 128) % 4 == 0):
+                            sf_vectors = self.hidden // 512
+                            for q_round in cutlass.range(
+                                    (sf_vectors + 31) // 32, unroll_full=True):
+                                q = q_round * 32 + lane
+                                if q < sf_vectors:
+                                    remote_vec = cute.make_ptr(
+                                        Uint32, remote_sf_base + Uint64(q * Uint32(16)),
+                                        cute.AddressSpace.gmem, assumed_align=16)
+                                    values = ld_global_u32x4(remote_vec)
+                                    for component in cutlass.range_constexpr(4):
+                                        sf_col = q * 4 + component
+                                        if cutlass.const_expr(self.wide_l1_sf):
+                                            l1_sf_bytes = cute.recast_ptr(
+                                                signals.iterator, dtype=Uint8) + \
+                                                Uint64(self.l1_sf_words) * Uint64(4)
+                                            sf_word = Uint64(sf_col) * \
+                                                Uint64(self.sf_ring_tokens) + Uint64(sf_row)
+                                            cute.recast_ptr(
+                                                l1_sf_bytes + sf_word * Uint64(4),
+                                                dtype=Uint32)[0] = values[component]
+                                        else:
+                                            signals[self.l1_sf_words +
+                                                    sf_col * self.sf_ring_tokens + sf_row] = \
+                                                values[component]
+                        else:
+                            for sf_round in cutlass.range(
+                                    (self.hidden // 128 + 31) // 32, unroll_full=True):
+                                sf_col = sf_round * 32 + lane
+                                if sf_col < self.hidden // 128:
+                                    remote_word = cute.make_ptr(
+                                        Uint32, remote_sf_base + Uint64(sf_col * Uint32(4)),
+                                        cute.AddressSpace.gmem, assumed_align=4)
+                                    if cutlass.const_expr(self.wide_l1_sf):
+                                        l1_sf_bytes = cute.recast_ptr(
+                                            signals.iterator, dtype=Uint8) + \
+                                            Uint64(self.l1_sf_words) * Uint64(4)
+                                        sf_word = Uint64(sf_col) * \
+                                            Uint64(self.sf_ring_tokens) + Uint64(sf_row)
+                                        cute.recast_ptr(
+                                            l1_sf_bytes + sf_word * Uint64(4),
+                                            dtype=Uint32)[0] = remote_word[0]
+                                    else:
+                                        signals[self.l1_sf_words +
+                                                sf_col * self.sf_ring_tokens + sf_row] = \
+                                            remote_word[0]
+                    cute.arch.sync_warp()
+                    if elect_one_sync():
+                        signals[self.l1_weight_words + pool_token % self.ring_tokens] = weight
+                        signals[self.metadata_words + pool_token * 3] = src_rank
+                        signals[self.metadata_words + pool_token * 3 + 1] = src_token
+                        signals[self.metadata_words + pool_token * 3 + 2] = topk_slot
+                        # The last remote G2S overlapped weight/SF work. Drain
+                        # it, store the chunk, then publish W1 after S2G finishes.
+                        if cutlass.const_expr(not self.direct_pull):
+                            cute.arch.mbarrier_wait(warp_bar, pull_phase)
+                            pull_phase ^= Uint32(1)
+                            final_byte_words = (self.pull_chunks - 1) * (self.pull_bytes // 4)
+                            bulk_s2g_1d(dst_x + final_byte_words, warp_pull,
+                                         Uint32(self.pull_bytes))
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0)
+                        is_last_token = token_idx == expert_end - Uint32(1)
+                        full_increment = Uint32(self.block_m) - (pull_token % self.block_m) \
+                            if is_last_token else Uint32(1)
+                        red_release_gpu_add_u32(
+                            signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block,
+                            Uint32(full_increment))
+                    cute.arch.sync_warp()
+                    token_idx += Uint32(self.dispatch_sms * self.dispatch_warps)
+                    current_expert, expert_start, expert_end, pool_block_offset = \
+                        advance_expert(
+                            expert_counts, token_idx, current_expert, expert_start,
+                            expert_end, pool_block_offset, lane, self.local_experts,
+                            self.block_m)
         elif cutlass.const_expr(self.role == 2):
             if physical_warp == 0:
                 # Each descriptor has its own aligned by-value kernel
@@ -1134,7 +1187,7 @@ class GCMoERoleKernel:
                     prefetch_tensormap(tensor_map_21.iterator)
             smem = cutlass.utils.SmemAllocator()
             slab = cute.recast_ptr(
-                smem.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
+                smem.allocate(self.smem_bytes, 1024), dtype=Uint8)
             full = cute.recast_ptr(slab + self.shared_layout.task_full, dtype=Uint64)
             empty = cute.recast_ptr(slab + self.shared_layout.task_empty, dtype=Uint64)
             task = cute.recast_ptr(slab + self.shared_layout.tasks, dtype=Uint32)
@@ -1177,7 +1230,7 @@ class GCMoERoleKernel:
                     iteration, Int32(lane), Int32(block), num_tokens,
                     self.block_m,
                     self.compute_sms,
-                    self.dispatch_sms,
+                    self.route_publishers,
                     self.hidden,
                     self.intermediate,
                     self.l1_clusters,
@@ -1185,6 +1238,7 @@ class GCMoERoleKernel:
                     self.local_experts,
                     self.num_ranks,
                     self.shared_experts,
+                    self.l1_group,
                 )
             # The same two-slot task stream drives both TMA producer warps
             # and the leader MMA warp. All three consume every valid phase.
@@ -1193,6 +1247,8 @@ class GCMoERoleKernel:
                 task_iter = Uint32(0)
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
+                cache_phase = Uint32(0)
+                cached_pool = Uint32(0xffffffff)
                 running = True
                 while running:
                     task_stage = task_iter % Uint32(2)
@@ -1260,6 +1316,17 @@ class GCMoERoleKernel:
                                 (pool_block // Uint32(self.ring_blocks) + Uint32(1))
                             while ld_acquire_gpu_u32(l1_full_ptr) != required:
                                 pass
+                            if cutlass.const_expr(self.direct_pull):
+                                if cached_pool != pool_block:
+                                    cache_peer_tile(
+                                        signals, peer_ptrs, slab + self.ll_cache_offset,
+                                        cute.recast_ptr(slab + self.ll_sf_offset, dtype=Uint32),
+                                        cute.recast_ptr(slab + self.ll_bar_offset, dtype=Uint64),
+                                        cache_phase, pool_block, valid_m, cta_rank, Uint32(lane),
+                                        self.block_m, self.hidden, self.num_ranks,
+                                        self.metadata_words, self.input_x_words, self.input_sf_words)
+                                    cache_phase ^= Uint32(1)
+                                    cached_pool = pool_block
                         if cutlass.const_expr(self.shared_experts > 0):
                             if task_phase == Uint32(GCBlockPhase.SharedLinear2):
                                 shared_full_ptr = signals.iterator + \
@@ -1283,23 +1350,53 @@ class GCMoERoleKernel:
                                 required_mask = Uint64(3) << (k_block * Uint32(2))
                                 while (pending & required_mask) != Uint64(0):
                                     pending = ld_acquire_gpu_u64(mask_ptr) ^ expected
-                            load_mixed_k128_tma(
-                                activation_map, activation_sf_map,
-                                weight_map, weight_sf_map,
-                                data_a + data_stage * (self.block_m // 2 * 128),
-                                data_sfa + data_stage * self.sf_block_m,
-                                data_b + data_stage * (128 * 128),
-                                data_sfb + data_stage * 128,
-                                data_full + data_stage, data_empty + data_stage,
-                                k_block, data_phase, block_idx,
-                                n_cluster * Uint32(2) + cta_rank,
-                                local_expert, valid_m, activation_rows, shape_k,
-                                is_shared, cta_rank, 0,
-                                self.block_m, self.sf_block_m,
-                                self.shared_weight_gran_k,
-                                self.shared_experts > 0,
-                                self.shared_weight_cache_hint,
-                                self.routed_weight_linger)
+                            if cutlass.const_expr(self.direct_pull):
+                                if task_phase == Uint32(GCBlockPhase.Linear1):
+                                    load_cached_k128(
+                                        slab + self.ll_cache_offset,
+                                        cute.recast_ptr(slab + self.ll_sf_offset, dtype=Uint32),
+                                        data_a + data_stage * (self.block_m // 2 * 128),
+                                        data_sfa + data_stage * self.sf_block_m,
+                                        data_full + data_stage, data_empty + data_stage,
+                                        k_block, data_phase, valid_m,
+                                        Uint32(lane), self.block_m,
+                                        self.sf_block_m, self.hidden)
+                                else:
+                                    load_mixed_k128_tma(
+                                        activation_map, activation_sf_map,
+                                        weight_map, weight_sf_map,
+                                        data_a + data_stage * (self.block_m // 2 * 128),
+                                        data_sfa + data_stage * self.sf_block_m,
+                                        data_b + data_stage * (128 * 128),
+                                        data_sfb + data_stage * 128,
+                                        data_full + data_stage, data_empty + data_stage,
+                                        k_block, data_phase, block_idx,
+                                        n_cluster * Uint32(2) + cta_rank,
+                                        local_expert, valid_m, activation_rows, shape_k,
+                                        is_shared, cta_rank, 0,
+                                        self.block_m, self.sf_block_m,
+                                        self.shared_weight_gran_k,
+                                        self.shared_experts > 0,
+                                        self.shared_weight_cache_hint,
+                                        self.routed_weight_linger)
+                            else:
+                                load_mixed_k128_tma(
+                                    activation_map, activation_sf_map,
+                                    weight_map, weight_sf_map,
+                                    data_a + data_stage * (self.block_m // 2 * 128),
+                                    data_sfa + data_stage * self.sf_block_m,
+                                    data_b + data_stage * (128 * 128),
+                                    data_sfb + data_stage * 128,
+                                    data_full + data_stage, data_empty + data_stage,
+                                    k_block, data_phase, block_idx,
+                                    n_cluster * Uint32(2) + cta_rank,
+                                    local_expert, valid_m, activation_rows, shape_k,
+                                    is_shared, cta_rank, 0,
+                                    self.block_m, self.sf_block_m,
+                                    self.shared_weight_gran_k,
+                                    self.shared_experts > 0,
+                                    self.shared_weight_cache_hint,
+                                    self.routed_weight_linger)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))

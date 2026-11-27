@@ -616,7 +616,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     l1_group = int(os.environ.get('GC_MOE_LL_L1_GROUP', '2')) if low_latency and direct_pull else 1
     if l1_group not in (1, 2, 4, 8):
         raise ValueError('GC_MOE_LL_L1_GROUP must be 1, 2, 4 or 8')
-    key = (key, low_latency, direct_pull, l1_group, direct_pipeline, context.dispatch_first)
+    key = (key, low_latency, direct_pull, l1_group, direct_pipeline, context.dispatch_first, tuple(os.environ.get(n, '') for n in ('LL_INC','LL_INC_CTAS','LL_INC_CHUNK','LL_INC_ORDER','LL_INC_OVERLAP','LL_INC_POLL','LL_INC_LOAD','LL_INC_PRODUCER_ONLY','LL_INC_PUBLISH')))
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -699,8 +699,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                 ptxas_options=compiler_identity.ptxas_options))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
-                            role, cubin, role_config.dynamic_smem,
-                            role_config.threads,
+                            role, cubin, 0 if role == 3 and role_kernel.incremental else role_config.dynamic_smem,
+                            128 if role == 3 and role_kernel.incremental else role_config.threads,
                             context.dispatch_sms if role == 1 else
                             context.compute_sms if role == 2 else
                             role_kernel.finalize_sms))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 import math
+import os
 from cutlass import Float32, Int32, Uint8, Uint16, Uint32, Uint64
 
 from ..comm.gc_barrier import (
@@ -51,7 +52,9 @@ from ..mma.sm100 import (
     kmajor_smem_desc_from_start,
     select_weight_format,
 )
+from ..ptx.utils import fence_acq_rel_sys
 from ..ptx.ld_st import (
+    ld_acquire_sys_u32, st_release_sys_u32,
     EVICT_FIRST,
     EVICT_NORMAL,
     atom_add_u64,
@@ -294,6 +297,16 @@ class GCMoERoleKernel:
             raise ValueError('NVLink barrier timeout must fit positive INT_MAX seconds')
         self.l1_group = l1_group
         self.dispatch_first = dispatch_first
+        self.incremental = low_latency and os.environ.get('LL_INC', '0') == '1' and (role != 3 or os.environ.get('LL_INC_PRODUCER_ONLY', '0') != '1')
+        self.inc_ctas = int(os.environ.get('LL_INC_CTAS', '4'))
+        self.inc_chunk = int(os.environ.get('LL_INC_CHUNK', '512'))
+        self.inc_cta_publish = os.environ.get('LL_INC_PUBLISH', 'warp') == 'cta'
+        self.inc_load_batch = os.environ.get('LL_INC_LOAD', 'serial') == 'batch'
+        self.inc_batch = os.environ.get('LL_INC_POLL', 'serial') == 'batch'
+        self.inc_arrival = os.environ.get('LL_INC_ORDER', 'fixed') == 'arrival'
+        if self.incremental and (direct_pull or self.inc_ctas not in (2,4,8,16) or
+                                 self.inc_chunk not in (256,512,1024) or hidden % self.inc_chunk):
+            raise ValueError('unsupported incremental combine geometry')
         self.low_latency = low_latency
         self.direct_pull = direct_pull
         self.direct_pipeline = direct_pipeline
@@ -378,6 +391,8 @@ class GCMoERoleKernel:
         if low_latency and role == 3 and finalize_output:
             self.finalize_sms = min(compute_sms, max(8,
                 (num_tokens * self.combine_chunks + COMBINE_WARPS - 1) // COMBINE_WARPS))
+        if self.incremental and role == 3:
+            self.finalize_sms = self.inc_ctas
         self.shared_layout = role_config.shared_layout
         self.direct_cache = (get_direct_pull_cache_layout(
             self.shared_layout.field_end, block_m, hidden, direct_pipeline)
@@ -400,6 +415,7 @@ class GCMoERoleKernel:
         self.shared_l2_sf_words = layout.views['shared_l2_acts_sf'].offset // 4
         self.shared_sf_tokens = ((capacity + 7) // 8) * 128
         self.combine_words = layout.views['combine_tokens'].offset // 4
+        self.inc_ready_bytes = layout.views['incremental_ready'].offset
         self.metadata_words = layout.workspace_offsets['token_src_metadata'] // 4
         self.ring_tokens = layout.ring_tokens
         self.sf_ring_tokens = layout.sf_ring_tokens
@@ -523,7 +539,11 @@ class GCMoERoleKernel:
             red_gpu_add_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
                 Uint32(1))
-        warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
+        # Incremental consumer/footer uses a plain 128-thread launch and
+        # no register redistribution. Keeping setmaxnreg here inflated the
+        # shared consumer/footer binary's launch register reservation.
+        if cutlass.const_expr(not self.incremental):
+            warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
 
         if block == 0:
             send_off = SIGNAL_OFFSETS['expert_send_count'] // 4
@@ -571,6 +591,138 @@ class GCMoERoleKernel:
         # targets the alternate generation and ordering is carried by the
         # all-expert sum acquires in the intervening call. Selected-peer
         # ready acquires protect each source's single-buffer inputs/indices.
+
+    @cute.jit
+    def _incremental_combine(self, signals, num_tokens, y_out, block, warp, lane):
+        # One warp retains one output chunk in FP32 registers until complete.
+        # Ready epochs are never cleared; the footer advances the generation
+        # only after BOTH producers and every consumer have finished.
+        epoch = ld_volatile_u32(signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) + Uint32(1)
+        base = cute.recast_ptr(signals.iterator, dtype=Uint8)
+        ready = cute.recast_ptr(base + Uint64(self.inc_ready_bytes), dtype=Uint32)
+        routes = cute.recast_ptr(signals.iterator + self.topk_offset_words, dtype=Uint64)
+        slots = ([self.topk] if self.shared_experts > 0 else []) + list(range(self.topk))
+        chunks = self.hidden // self.inc_chunk
+        task = block * Uint32(4) + warp
+        while task < num_tokens * Uint32(chunks):
+            token = task // Uint32(chunks)
+            channel = (task % Uint32(chunks)) * Uint32(self.inc_chunk)
+            accum = cute.make_rmem_tensor((self.inc_chunk // 32,), Float32)
+            for j in cutlass.range_constexpr(self.inc_chunk // 32):
+                accum[j] = Float32(0)
+            pending = Uint32((1 << len(slots)) - 1)
+            start = read_clock64()
+            while pending != Uint32(0):
+                ready_mask = Uint32(0xffffffff)
+                if cutlass.const_expr(self.inc_batch):
+                    # Each of the first 9 lanes polls ONE contribution.
+                    # Use matching 32-bit accesses for independently published flags.
+                    # Poll slots in parallel, not nine serial load/ballot rounds.
+                    done_slot = True
+                    if lane < Uint32(len(slots)):
+                        source_slot = lane
+                        if cutlass.const_expr(self.shared_experts > 0):
+                            source_slot = lane - Uint32(1)
+                            if lane == Uint32(0):
+                                source_slot = Uint32(self.topk)
+                        valid_slot = True
+                        if source_slot != Uint32(self.topk):
+                            valid_slot = routes[token * Uint32(self.topk) + source_slot] < Uint64(self.num_ranks * self.local_experts)
+                        if valid_slot and (pending & (Uint32(1) << lane)) != Uint32(0):
+                            flag_idx = (Uint64(source_slot) * Uint64(self.capacity) + Uint64(token)) * Uint64(self.hidden // 128) + Uint64(channel // Uint32(128))
+                            ptr = ready + flag_idx
+                            expected = epoch
+                            for seg in cutlass.range_constexpr(self.inc_chunk // 128):
+                                sample = ld_acquire_sys_u32(ptr + Uint32(seg))
+                                done_slot = done_slot and sample == expected
+                    cute.arch.sync_warp()
+                    ready_mask = cute.arch.vote_ballot_sync(done_slot)
+                if cutlass.const_expr(self.inc_load_batch):
+                    consume = ready_mask & pending
+                    if cutlass.const_expr(not self.inc_arrival):
+                        blocked = False
+                        for jslot in cutlass.range_constexpr(len(slots)):
+                            if (pending & Uint32(1 << jslot)) != Uint32(0):
+                                if (ready_mask & Uint32(1 << jslot)) == Uint32(0):
+                                    blocked = True
+                                if blocked:
+                                    consume &= ~Uint32(1 << jslot)
+                    payload = cute.make_rmem_tensor((len(slots), self.inc_chunk // 256, 4), Uint32)
+                    # Issue independent vector loads for all currently ready
+                    # contributions before consuming any of the returned data.
+                    for jslot in cutlass.range_constexpr(len(slots)):
+                        slot = slots[jslot]
+                        if (consume & Uint32(1 << jslot)) != Uint32(0):
+                            valid = True
+                            if cutlass.const_expr(slot != self.topk):
+                                valid = routes[token * Uint32(self.topk) + Uint32(slot)] < Uint64(self.num_ranks * self.local_experts)
+                            if valid:
+                                src = cute.recast_ptr(base + Uint64(self.combine_words * 4), dtype=Uint32) + \
+                                    ((Uint64(slot) * Uint64(self.capacity) + Uint64(token)) * Uint64(self.hidden) + Uint64(channel)) // Uint64(2)
+                                for vec in cutlass.range_constexpr(self.inc_chunk // 256):
+                                    words = ld_global_u32x4(src + (Uint32(vec*32) + lane) * Uint32(4))
+                                    for q in cutlass.range_constexpr(4):
+                                        payload[jslot,vec,q] = words[q]
+                            else:
+                                consume &= ~Uint32(1 << jslot)
+                                pending &= ~Uint32(1 << jslot)
+                    for jslot in cutlass.range_constexpr(len(slots)):
+                        if (consume & Uint32(1 << jslot)) != Uint32(0):
+                            for vec in cutlass.range_constexpr(self.inc_chunk // 256):
+                                for q in cutlass.range_constexpr(4):
+                                    word = payload[jslot,vec,q]
+                                    accum[vec*8+q*2] = accumulate_bf16_into_f32(accum[vec*8+q*2], Uint16(word & Uint32(0xffff)))
+                                    accum[vec*8+q*2+1] = accumulate_bf16_into_f32(accum[vec*8+q*2+1], Uint16(word >> Uint32(16)))
+                    pending &= ~consume
+                else:
+                    for jslot in cutlass.range_constexpr(len(slots)):
+                        slot = slots[jslot]
+                        eligible = (pending & Uint32(1 << jslot)) != Uint32(0) and (ready_mask & Uint32(1 << jslot)) != Uint32(0)
+                        if cutlass.const_expr(self.inc_batch and not self.inc_arrival):
+                            eligible = eligible and (pending & Uint32((1 << jslot) - 1)) == Uint32(0)
+                        if eligible:
+                            valid = True
+                            if cutlass.const_expr(slot != self.topk):
+                                valid = routes[token * Uint32(self.topk) + Uint32(slot)] < Uint64(self.num_ranks * self.local_experts)
+                            if valid:
+                                done = True
+                                if cutlass.const_expr(not self.inc_batch):
+                                    idx = (Uint64(slot) * Uint64(self.capacity) + Uint64(token)) * Uint64(self.hidden // 128) + Uint64(channel // Uint32(128))
+                                    done = True
+                                    if lane < Uint32(self.inc_chunk // 128):
+                                        done = ld_acquire_sys_u32(ready + idx + Uint64(lane)) == epoch
+                                    if cutlass.const_expr(not self.inc_arrival):
+                                        while cute.arch.vote_ballot_sync(done) != Uint32(0xffffffff):
+                                            if lane < Uint32(self.inc_chunk // 128) and not done:
+                                                done = ld_acquire_sys_u32(ready + idx + Uint64(lane)) == epoch
+                                            if Uint64(read_clock64() - start) > Uint64(20 * 2000000000):
+                                                cute.printf('inc timeout token={} slot={} channel={} epoch={}', token, slot, channel, epoch)
+                                                device_trap()
+                                if cute.arch.vote_ballot_sync(done) == Uint32(0xffffffff):
+                                    # Warp synchronization transfers the elected
+                                    # acquire to every lane reading this chunk.
+                                    cute.arch.sync_warp()
+                                    src = cute.recast_ptr(base + Uint64(self.combine_words * 4), dtype=Uint32) + \
+                                        ((Uint64(slot) * Uint64(self.capacity) + Uint64(token)) * Uint64(self.hidden) + Uint64(channel)) // Uint64(2)
+                                    for vec in cutlass.range_constexpr(self.inc_chunk // 256):
+                                        words = ld_global_u32x4(src + (Uint32(vec * 32) + lane) * Uint32(4))
+                                        for q in cutlass.range_constexpr(4):
+                                            accum[vec*8+q*2] = accumulate_bf16_into_f32(accum[vec*8+q*2], Uint16(words[q] & Uint32(0xffff)))
+                                            accum[vec*8+q*2+1] = accumulate_bf16_into_f32(accum[vec*8+q*2+1], Uint16(words[q] >> Uint32(16)))
+                                    pending &= ~Uint32(1 << jslot)
+                            else:
+                                pending &= ~Uint32(1 << jslot)
+                if Uint64(read_clock64() - start) > Uint64(20 * 2000000000):
+                    cute.printf('inc arrival timeout token={} channel={} epoch={}', token, channel, epoch)
+                    device_trap()
+            dst = cute.recast_ptr(y_out.iterator, dtype=Uint32) + \
+                (Uint64(token) * Uint64(self.hidden) + Uint64(channel)) // Uint64(2)
+            for vec in cutlass.range_constexpr(self.inc_chunk // 256):
+                words = cute.make_rmem_tensor((4,), Uint32)
+                for q in cutlass.range_constexpr(4):
+                    words[q] = pack_bf16_pair(accum[vec*8+q*2], accum[vec*8+q*2+1])
+                st_global_u32x4(dst + (Uint32(vec*32) + lane) * Uint32(4), words[0],words[1],words[2],words[3])
+            task += Uint32(self.inc_ctas * 4)
 
     @cute.jit
     def _role3_combine(self, signals: cute.Tensor, rank_idx: Uint32,
@@ -2020,7 +2172,39 @@ class GCMoERoleKernel:
                                             st_global_u32x4(
                                                 dst, words[0], words[1],
                                                 words[2], words[3])
+                                        if cutlass.const_expr(self.incremental and not self.inc_cta_publish):
+                                            # Each half warp wrote all 128 channels
+                                            # of one row. Release every writer's
+                                            # stores, then its leader publishes one
+                                            # epoch for the whole 256-byte tile.
+                                            fence_acq_rel_sys()
+                                            cute.arch.sync_warp()
+                                            if token_in_block < valid_m and lane % 16 == 0:
+                                                idx = (Uint64(src_metadata[atom][2]) * Uint64(self.capacity) + Uint64(src_metadata[atom][1])) * Uint64(self.hidden // 128) + Uint64(n_block)
+                                                flag = cute.make_ptr(Uint32,
+                                                    mapped_peer_base(peer_ptrs, src_metadata[atom][0], self.num_ranks) + Uint64(self.inc_ready_bytes) + idx * Uint64(4),
+                                                    cute.AddressSpace.gmem, assumed_align=4)
+                                                epoch = ld_volatile_u32(signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) + Uint32(1)
+                                                st_release_sys_u32(flag, epoch)
                         sync_aligned(256, 2)
+                        if cutlass.const_expr(self.incremental and self.inc_cta_publish):
+                            if task_phase == Uint32(GCBlockPhase.Linear2) or task_phase == Uint32(GCBlockPhase.SharedLinear2):
+                                # Reuse the existing epilogue join: every peer
+                                # data store precedes this bar.cta.sync. The
+                                # system release below carries those writes
+                                # transitively to the consumer's system acquire.
+                                # No per-writer system fence or extra barrier.
+                                row = Uint32(tid) - Uint32(128)
+                                if row < valid_m:
+                                    record = _load_w2_source_metadata(signals.iterator + self.metadata_words,
+                                        row, valid_m, pool_block * Uint32(self.block_m) + row,
+                                        rank_idx, task_phase == Uint32(GCBlockPhase.SharedLinear2), self.topk, self.shared_experts > 0)
+                                    idx = (Uint64(record[2]) * Uint64(self.capacity) + Uint64(record[1])) * Uint64(self.hidden // 128) + Uint64(n_cluster * Uint32(2) + cta_rank)
+                                    flag = cute.make_ptr(Uint32,
+                                        mapped_peer_base(peer_ptrs, record[0], self.num_ranks) + Uint64(self.inc_ready_bytes) + idx * Uint64(4),
+                                        cute.AddressSpace.gmem, assumed_align=4)
+                                    epoch = ld_volatile_u32(signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) + Uint32(1)
+                                    st_release_sys_u32(flag, epoch)
                     is_w1_release = task_phase == Uint32(GCBlockPhase.Linear1)
                     if cutlass.const_expr(self.shared_experts > 0):
                         is_w1_release = is_w1_release or \
@@ -2052,39 +2236,48 @@ class GCMoERoleKernel:
                 if physical_warp == 4:
                     tmem_free_2cta(tptr[0], Uint32(self.tmem_cols))
         else:
-            # Both graph workers precede role 3. Fused finalization uses
-            # warp-owned barriers; legacy paths retain the whole-CTA join.
-            combine_smem = cute.recast_ptr(signals.iterator, dtype=Uint8)
-            combine_bars = cute.recast_ptr(signals.iterator, dtype=Uint64)
-            if cutlass.const_expr(self.finalize_output):
-                # One fetch plane per combine slot; the output plane aliases
-                # slot 0. Both live inside the role3 reusable prefix.
-                combine_alloc = cutlass.utils.SmemAllocator()
-                combine_smem = cute.recast_ptr(
-                    combine_alloc.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
-                combine_bars = cute.recast_ptr(
-                    combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
-                if cutlass.const_expr(self.shared_experts > 0):
-                    cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.incremental):
+                if (num_tokens & Uint32(0x80000000)) != Uint32(0):
+                    self._incremental_combine(signals, num_tokens & Uint32(0x7fffffff), y_out,
+                                              Uint32(block), Uint32(physical_warp), Uint32(lane))
                 else:
-                    self._initialize_shared_storage(
-                        combine_smem, Uint32(physical_warp), Uint32(lane))
-            # Role 1's epoch remains immutable throughout this role-3 launch.
-            # Each warp caches it independently; the footer advances recv_parity.
-            ready_epoch = Uint64(ld_volatile_u32(
-                signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
-            if cutlass.const_expr(not (self.finalize_output and self.shared_experts > 0)):
-                sync_unaligned(FINALIZE_THREADS, 1)
-            recv_off = SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
-            recv_ptr = signals.iterator + recv_off
-            if physical_warp < 4:
-                self._role3_dispatch(signals, peer_ptrs, rank_idx,
-                                     Uint32(tid), Uint32(block),
-                                     recv_ptr, stats, ready_epoch)
+                    ready_epoch = Uint64(ld_volatile_u32(signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
+                    recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
+                    self._role3_dispatch(signals, peer_ptrs, rank_idx, Uint32(tid), Uint32(block), recv_ptr, stats, ready_epoch)
             else:
-                self._role3_combine(signals, rank_idx, num_tokens, y_out,
-                                    block, physical_warp, lane,
-                                    combine_smem, combine_bars, ready_epoch)
+                # Both graph workers precede role 3. Fused finalization uses
+                # warp-owned barriers; legacy paths retain the whole-CTA join.
+                combine_smem = cute.recast_ptr(signals.iterator, dtype=Uint8)
+                combine_bars = cute.recast_ptr(signals.iterator, dtype=Uint64)
+                if cutlass.const_expr(self.finalize_output):
+                    # One fetch plane per combine slot; the output plane aliases
+                    # slot 0. Both live inside the role3 reusable prefix.
+                    combine_alloc = cutlass.utils.SmemAllocator()
+                    combine_smem = cute.recast_ptr(
+                        combine_alloc.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
+                    combine_bars = cute.recast_ptr(
+                        combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
+                    if cutlass.const_expr(self.shared_experts > 0):
+                        cute.arch.griddepcontrol_wait()
+                    else:
+                        self._initialize_shared_storage(
+                            combine_smem, Uint32(physical_warp), Uint32(lane))
+                # Role 1's epoch remains immutable throughout this role-3 launch.
+                # Each warp caches it independently; the footer advances recv_parity.
+                ready_epoch = Uint64(ld_volatile_u32(
+                    signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
+                if cutlass.const_expr(not (self.finalize_output and self.shared_experts > 0)):
+                    sync_unaligned(FINALIZE_THREADS, 1)
+                recv_off = SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
+                recv_ptr = signals.iterator + recv_off
+                if physical_warp < 4:
+                    self._role3_dispatch(signals, peer_ptrs, rank_idx,
+                                         Uint32(tid), Uint32(block),
+                                         recv_ptr, stats, ready_epoch)
+                else:
+                    self._role3_combine(signals, rank_idx, num_tokens, y_out,
+                                        block, physical_warp, lane,
+                                        combine_smem, combine_bars, ready_epoch)
 
     @cute.jit
     def __call__(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,
@@ -2150,25 +2343,25 @@ class GCMoERoleKernel:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens, tensor_maps,
                                 y_out, stats).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(FINALIZE_THREADS, 1, 1),
-                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
+                        block=((128 if self.incremental else FINALIZE_THREADS), 1, 1),
+                        max_number_threads=((128 if self.incremental else FINALIZE_THREADS), 1, 1), min_blocks_per_mp=1)
                 else:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens, tensor_maps,
                                 y_out, stats,
                                 activation_clamp, activation_alpha).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(FINALIZE_THREADS, 1, 1),
-                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
+                        block=((128 if self.incremental else FINALIZE_THREADS), 1, 1),
+                        max_number_threads=((128 if self.incremental else FINALIZE_THREADS), 1, 1), min_blocks_per_mp=1)
             else:
                 if cutlass.const_expr(activation_clamp is None and activation_alpha is None):
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(FINALIZE_THREADS, 1, 1),
-                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
+                        block=((128 if self.incremental else FINALIZE_THREADS), 1, 1),
+                        max_number_threads=((128 if self.incremental else FINALIZE_THREADS), 1, 1), min_blocks_per_mp=1)
                 else:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens,
                                 None, None, None,
                                 activation_clamp, activation_alpha).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(FINALIZE_THREADS, 1, 1),
-                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
+                        block=((128 if self.incremental else FINALIZE_THREADS), 1, 1),
+                        max_number_threads=((128 if self.incremental else FINALIZE_THREADS), 1, 1), min_blocks_per_mp=1)

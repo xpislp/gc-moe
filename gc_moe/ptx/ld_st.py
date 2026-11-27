@@ -482,3 +482,14 @@ def ld_shared_u32x4_sm90(ptr: cute.Pointer, *, loc=None, ip=None):
         '=r,=r,=r,=r,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
     return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i])) for i in range(4))
+
+@dsl_user_op
+def st_release_sys_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'st.release.sys.global.u32 [$0], $1;', 'l,r,~{memory}', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+@dsl_user_op
+def ld_acquire_sys_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
+    value = llvm.inline_asm(T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value()],
+        'ld.acquire.sys.global.u32 $0, [$1];', '=r,l,~{memory}', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(value)

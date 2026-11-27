@@ -243,9 +243,11 @@ class GCBufferLayout:
         add('l2_acts_sf', sr * i // 32, (sr, i // 128), 'int32', (1, sr))
         add('combine_tokens', (self.topk + bool(s)) * c * h * 2,
             (self.topk + bool(s), c, h), 'bfloat16')
+        add('incremental_ready', (self.topk + bool(s)) * c * (h // 128) * 4,
+            (self.topk + bool(s), c, h // 128), 'int32')
         return result
 
     @property
     def nbytes(self) -> int:
-        v = self.views['combine_tokens']
+        v = self.views['incremental_ready']
         return v.offset + v.nbytes

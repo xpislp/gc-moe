@@ -213,6 +213,7 @@ def main():
             prob = torch.randn((tokens,k),device=device).softmax(-1)
             expected = reference(dequant(x),idx,prob,raw,shared,rank,world)
             stock_output = None
+            stock_equal = None
             for v in variants:
                 stage(buffers[v],x,idx,prob,tokens,e,world,k,v)
                 dist.barrier(); torch.cuda.synchronize()
@@ -242,9 +243,11 @@ def main():
                 elif stock_output is not None:
                     equal = torch.tensor(int(torch.equal(ys[v], stock_output)), device=device)
                     dist.all_reduce(equal, op=dist.ReduceOp.MIN)
-                    assert equal.item() == 1, ('not bitwise equal to stock', tokens, pattern, v)
+                    stock_equal = bool(equal.item())
+                    if os.environ.get('LL_INC_ORDER') != 'arrival':
+                        assert stock_equal, ('not bitwise equal to stock', tokens, pattern, v)
                 results.append(dict(tokens=tokens,pattern=pattern,variant=v,accuracy=errs,
-                    stock_bitwise_equal=True if stock_output is not None else None))
+                    stock_bitwise_equal=True if v == 'gc' else stock_equal))
             if pattern == 'balanced' and args.profile:
                 for v in variants:
                     dist.barrier(); torch.cuda.synchronize()
@@ -283,7 +286,7 @@ def main():
             source_sha256=source_hashes,
             git_commit=git_output('rev-parse','HEAD'),
             git_status=git_output('status','--porcelain'),
-            ll_environment={k:v for k,v in os.environ.items() if k.startswith('GC_MOE_LL_')},
+            ll_environment={k:v for k,v in os.environ.items() if k.startswith(('GC_MOE_LL_', 'LL_INC'))},
             results=results),indent=2))
     dist.destroy_process_group()
 

@@ -216,6 +216,10 @@ class _ChildGraph:
         try:
             self.graph = _ok(cu.cuGraphCreate(0))
             nodes = []
+            if owner.incremental:
+                values = list(arguments[2].values)
+                values[3] = ctypes.c_uint32(values[3].value | 0x80000000)
+                self.incremental_args = _KernelArgs(values)
             for index, binary in enumerate(binaries):
                 loaded = owner._get_loaded_kernel(binary)
                 self.kernels.append(loaded)
@@ -235,7 +239,13 @@ class _ChildGraph:
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                dependencies = nodes[:2] if index == 2 else []
+                if index == 2 and owner.incremental:
+                    params.kernel.kernelParams = self.incremental_args.pointer
+                    early_deps = nodes[:2] if os.environ.get('LL_INC_OVERLAP', '1') == '0' else []
+                    early_node = _ok(cu.cuGraphAddNode(self.graph, early_deps, None, len(early_deps), params))
+                    nodes.append(early_node)
+                    params.kernel.kernelParams = arguments[index].pointer
+                dependencies = nodes[:] if index == 2 else []
                 edge_data = None
                 if index == 1 and owner.dispatch_first:
                     # Admit every dispatch CTA before compute can occupy the
@@ -300,6 +310,7 @@ class GreenContextPair:
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
         ll_green = low_latency and _get_env_int('GC_MOE_LL_USE_GREEN', 0) != 0
+        self.incremental = low_latency and os.environ.get('LL_INC', '0') == '1' and os.environ.get('LL_INC_PRODUCER_ONLY', '0') != '1'
         self.dispatch_first = low_latency and not ll_green and ll_dispatch_first
         self.primary_ctx_roles = ((low_latency and not ll_green) or
                                   (not low_latency and _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0))
@@ -310,6 +321,8 @@ class GreenContextPair:
         if low_latency and not ll_green:
             total = torch.cuda.get_device_properties(device_index).multi_processor_count
             self.compute_sms = (total - max(2, ll_dispatch_sms)) // 2 * 2
+            if self.incremental:
+                self.compute_sms -= int(os.environ.get('LL_INC_CTAS', '4'))
             self.dispatch_sms = ll_dispatch_sms
             parts = ()
             workqueue = None

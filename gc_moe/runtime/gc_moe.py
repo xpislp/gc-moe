@@ -236,7 +236,17 @@ class _ChildGraph:
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
                 dependencies = nodes[:2] if index == 2 else []
-                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
+                edge_data = None
+                if index == 1 and owner.dispatch_first:
+                    # Admit every dispatch CTA before compute can occupy the
+                    # remaining SMs. This is launch ordering, not completion:
+                    # the compute worker acquires each ready input separately.
+                    dependencies = [nodes[0]]
+                    edge = cu.CUgraphEdgeData()
+                    edge.from_port = cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER
+                    edge.type = int(cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC)
+                    edge_data = [edge]
+                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, edge_data,
                                              len(dependencies), params))
                 if index == 1:
                     attr = cu.CUkernelNodeAttrValue()
@@ -281,7 +291,8 @@ class GreenContextPair:
     @_runtime_locked
     def __init__(self, device_index: int | None = None,
                  requested_dispatch_sms: int | None = None, *,
-                 num_ranks: int = 1, low_latency: bool = False, ll_dispatch_sms: int = 1):
+                 num_ranks: int = 1, low_latency: bool = False, ll_dispatch_sms: int = 1,
+                 ll_dispatch_first: bool = False):
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         requested_dispatch_sms = _get_requested_dispatch_sms(
@@ -289,6 +300,7 @@ class GreenContextPair:
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
         ll_green = low_latency and _get_env_int('GC_MOE_LL_USE_GREEN', 0) != 0
+        self.dispatch_first = low_latency and not ll_green and ll_dispatch_first
         self.primary_ctx_roles = ((low_latency and not ll_green) or
                                   (not low_latency and _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0))
         if device_index is None:
@@ -547,7 +559,8 @@ class _ThreadContexts:
                 _pin_failed_pair(pair)
 
 
-def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: int = 1) -> GreenContextPair:
+def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: int = 1,
+                ll_dispatch_first: bool = False) -> GreenContextPair:
     requested_dispatch_sms = _get_requested_dispatch_sms(num_ranks)
     current = _ok(cu.cuCtxGetCurrent())
     holder = getattr(_THREAD_LOCAL, 'holder', None)
@@ -556,13 +569,14 @@ def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: i
     contexts = holder.contexts
     # Calls in different process groups may need different SM budgets even
     # on the same CUDA context. Reuse only the same effective SM request.
-    key = (int(current), requested_dispatch_sms, low_latency, ll_dispatch_sms,
+    key = (int(current), requested_dispatch_sms, low_latency, ll_dispatch_sms, ll_dispatch_first,
            _get_env_int('GC_MOE_LL_USE_GREEN', 0) if low_latency else 0,
            _get_env_int('GC_MOE_LL_COMPUTE_SMS', 0) if low_latency else 0)
     if key not in contexts or contexts[key]._state == 'closed':
         contexts[key] = GreenContextPair(
             requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks,
-            low_latency=low_latency, ll_dispatch_sms=ll_dispatch_sms)
+            low_latency=low_latency, ll_dispatch_sms=ll_dispatch_sms,
+            ll_dispatch_first=ll_dispatch_first)
     elif contexts[key]._state != 'open':
         raise RuntimeError(f"cached Green context pair is {contexts[key]._state}")
     return contexts[key]

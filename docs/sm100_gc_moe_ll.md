@@ -2,8 +2,55 @@
 
 新增接口 `gc_moe.fp8_fp4_gc_moe_ll`，支持 T/rank ≤ 32、EP ≤ 32。
 
-直接拉取路径现已去掉共享内存二次重排，最新实现、对照结果与限制见 [直接布局优化报告](sm100_direct_pull_optimization.md)。本页性能表保留初版 `878682f` 的记录。
+直接拉取路径现已去掉共享内存二次重排，最新实现、对照结果与限制见 [直接布局优化报告](sm100_direct_pull_optimization.md)。本文同时记录 11 月 27 日权重轮换结果与初版 `878682f` 的历史结果。
 这是对现有 SM100 MMA/量化/输出管线的低延迟特化：新写了路由登记、直接拉取缓存及其调度路径，复用已有 FP8×FP4 数学管线。不是将原接口改名，也不是完全重写所有 MMA/epilogue。
+
+## 2026-11-27：默认 LL 的启动顺序与权重轮换测试
+
+这次保留的改动只有两项：
+
+- 对 H=6144、I=2048、每卡 8 routed 专家、Top-8、1 个共享专家、0<T/rank≤32 的默认路径，使用 CUDA Graph 的 programmatic launch-order edge，让 Dispatch 的 CTA 先获得启动机会，再启动计算。它不是等待整个 Dispatch 完成。计算仍依据原有 `l1_full_count` 等就绪协议消费数据；计算初始化不再执行会把这条依赖变成整阶段等待的 `griddepcontrol.wait`。原有输入环形区、W1/SwiGLU/量化、W2、最终 Combine 均保留。
+- T/rank=32 的 Dispatch 从 8 warp 改为 16 warp；更小档仍用 8。计算 CTA 数没有增加，本机仍为 144 个 CTA / 72 个双 CTA cluster。没有新增对称显存区或常驻 Combine 消费者。
+
+上下文缓存与编译准备缓存均包含启动策略，warp 数进入资源布局与编译键。`GC_MOE_LL_TUNING=0` 可切回改动前的默认 LL，用于同进程交替对照。其他形状、显式 Green Context 和非默认直接拉取路径维持原策略。这是指定形状的实测选择，不代表所有 MoE 形状均应使用这些参数。
+
+程序化启动依赖的语义见 [NVIDIA CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html)。这里继续依靠已有 release/acquire 输入就绪协议，不能在任意计算 kernel 上直接删除等待。
+
+### 同轮三方结果
+
+| T/rank | 原 GC（µs） | 改动前默认 LL（µs） | 当前默认 LL（µs） | 相对原 GC 降低 |
+|---:|---:|---:|---:|---:|
+| 4 | 54.605 | 52.793 | 48.621 | 10.96% |
+| 8 | 54.877 | 52.925 | 49.135 | 10.46% |
+| 16 | 56.789 | 55.808 | 50.947 | 10.29% |
+| 32 | 65.429 | 65.029 | 57.675 | 11.85% |
+
+硬件仍是单机 EP4 / SM100，GLM5.2 参数形状的合成量化权重。每卡 8 个 routed 专家，H6144/I2048/Top-8，1 个共享专家。每个目标调用前运行三套不同地址的权重；它们复制相同量化数值，目的是测权重地址轮换，而非模拟不同层的数值分布。CUDA Graph 内的 external timing events 只包围目标调用，不把前三次调用计入延迟。每窗平均 24 个目标调用，取四 rank 最大值；21 个窗口交替测试三种路径，再取窗口中位数。该统计量不是逐调用 p50/p95。仍不包含输入准备、权重重排、首次编译，也不是完整模型推理或真实 EP32 网络测试。
+
+### 其他方案的取舍
+
+- Dispatch 12/16 warp：单独加宽会使 T≤16 变慢，T=32 有收益，因此不全局加宽。
+- 计算 CTA 接续：未限制启动顺序时，增加 CTA 会挤占 Dispatch 的驻留空间，导致路由 grid barrier 超时，这种配置无有效性能结果。加入启动顺序依赖后，+8/+16 CTA 通过正确性，但没有稳定超过不增加 CTA 的更简单方案，因此不保留额外 CTA。
+- Dispatch 完全完成后再计算：正确，但损失重叠，约 60–79 µs，不保留。
+- 提前 Combine / 独立标志：试过每 16 字节结果发布一次标志、每 128 个输出通道发布一次标志，均将提前消费与结束后的状态清理分开。分片 ready 使用轮次及系统级发布/获取。粗粒度版本测试了寄存器读取和批量 TMA 读取，仍慢于原版；不能只删除原图依赖而保留提前清理。
+- 提前 Combine / 数据内轮次标记：把 BF16x2 的 32 位数据和 32 位轮次放在同一个 64 位系统级访问中，避免使用可能与合法输出冲突的数值 sentinel，并避免独立标志栅栏。但输出回传字节翻倍且系统级标量访问增多，仍明显变慢。
+- 提前消费相对同一实验中的延后消费确实隐藏了一部分尾部工作，但这些实现增加的同步、访问和消费成本超过收益。上述实验没有并入生产路径；这不等于证明论文的其他协议或真实 EP32 上一定无效。
+
+正确性覆盖 T=0/1/2/3/4/7/8/16/17/24/31/32 的均衡、随机、热点、空路由、部分无效路由，共 60 个形状/路由组合；三种实现均通过独立 Torch 参考校验，新/旧 LL 在四个 rank 上均与原 GC 逐字节一致，并覆盖改输入后的 Graph replay。Memcheck 的四 rank 均为 0 errors；只针对三种 MoE role kernel 的 Racecheck 四 rank 均为 0 hazards / 0 errors / 0 warnings，检查 T=4/32 的均衡、热点、部分无效路由及重放。
+
+Sanitizer 使用 `--report-api-errors no`：初次报告只有 CUDA bindings 对较新 API 版本的 `cuGetProcAddress` 探测失败（13.1/13.2 查询、13.0 驱动），没有设备内存错误。复测仅关闭 API 错误报告，保留 memcheck/racecheck 检测和非零错误退出码。未过滤的 Racecheck 在权重生成阶段超时，随后用已从 profiler 核实的 `--kernel-name kns=GCMoERoleKernel` 只检查三个 MoE role，完整通过。Sanitizer 下的延迟不能作性能结果。
+
+原始窗口、参考误差、逐字节检查结果、软件版本、源码摘要及弃用方案记录见 [启动顺序实验数据](benchmarks/sm100_ll_launch_order_trials.json)。
+
+复现三方权重轮换测试：
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  tests/bench_gc_moe_ll.py --variants gc,ll_legacy,ll_stage \
+  --tokens 4,8,16,32 --patterns balanced,random,skew,empty,mixed \
+  --weight-rotations 3 --graph-calls 24 --repeats 21 --warmup-graphs 30 \
+  --output results/ll/rotation.json
+```
 
 ## 默认路径与实验路径
 
@@ -27,7 +74,7 @@
 
 没有实现完整 W1→SwiGLU→W2 的 I 分片融合或 split-K。以 M=32、H=6144、I=2048、I 分片=128 为例，16 份 FP32 W2 partial 在每专家会占约 12 MiB，8 专家约 96 MiB；现有 FP8 中间激活总共约 0.5 MiB。若把 partial 写到显存再归约，额外读写可能超过省下的中间激活流量。避免 partial 落地的融合方案仍需独立实现及验证。
 
-## 测试口径
+## 初版测试口径（2026-11-26）
 
 2026-11-26，单机四卡，CUDA capability 10.0，设备报告名 `NVIDIA L20A`（不能据此按 Ada 判断）。PyTorch 2.13.0+cu130，CuTe DSL 4.8.1，CUDA Python 13.2.0，系统 CUDA 13.2 ptxas。
 
@@ -79,6 +126,7 @@ python -m torch.distributed.run --nproc_per_node=4 \
 
 实验开关必须在各 rank 一致设置：
 
+- `GC_MOE_LL_TUNING=0/1`：指定 GLM 小 batch 默认路径的启动顺序与 T=32 Dispatch 加宽；默认 1，0 用于旧 LL 对照。
 - `GC_MOE_LL_L1_GROUP=1/2/4/8`：直接拉取的 W1 N 分组，默认 2。
 - `GC_MOE_LL_USE_GREEN=1`：对照 Green 分区；默认 0。本机直接拉取实验下没有收益。
 - `GC_MOE_LL_COMPUTE_SMS=<偶数>`：覆盖计算 grid 上限，默认使用扣除路由驻留预算后的 SM 数。缩小到 128 在本次直接拉取实验中没有收益。

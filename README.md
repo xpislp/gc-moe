@@ -15,7 +15,9 @@ it does not compile CUDA kernels.
 ## SM100 small-batch path
 
 `fp8_fp4_gc_moe_ll` specializes T/rank ≤ 32 with expert-owned routing,
-primary-context worker kernels and a smaller finalize grid. It reuses the
+primary-context worker kernels and a smaller finalize grid. The measured GLM
+decode geometry also uses dispatch-first launch ordering and 16 dispatch warps
+at T/rank=32; `GC_MOE_LL_TUNING=0` selects the previous scheduling policy. It reuses the
 GC buffer/weight contract; use `get_block_m_for_gc_moe_ll` when staging
 shared input scales. An explicit `direct_pull=True` enables the experimental
 compute-CTA input cache, which was slower on the tested EP4 GLM5.2 shapes.

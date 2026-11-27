@@ -585,7 +585,9 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if low_latency:
         role_configs = tuple(get_ll_role_config(role, config.block_m,
             sym_buffer.num_experts, config.hidden, local_experts=config.local_experts,
-            direct_pull=direct_pull, direct_pipeline=direct_pipeline) for role in (1, 2, 3))
+            direct_pull=direct_pull, direct_pipeline=direct_pipeline,
+            dispatch_warps=16 if context.dispatch_first and config.tokens == 32 else None)
+            for role in (1, 2, 3))
     else:
         role_configs = tuple(get_role_config(role, config.block_m,
                                              sym_buffer.num_experts,
@@ -614,7 +616,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     l1_group = int(os.environ.get('GC_MOE_LL_L1_GROUP', '2')) if low_latency and direct_pull else 1
     if l1_group not in (1, 2, 4, 8):
         raise ValueError('GC_MOE_LL_L1_GROUP must be 1, 2, 4 or 8')
-    key = (key, low_latency, direct_pull, l1_group, direct_pipeline)
+    key = (key, low_latency, direct_pull, l1_group, direct_pipeline, context.dispatch_first)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -656,7 +658,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         routed_weight_linger=routed_weight_linger,
                         low_latency=low_latency, direct_pull=direct_pull, l1_group=l1_group,
-                        direct_pipeline=direct_pipeline,
+                        direct_pipeline=direct_pipeline, dispatch_first=context.dispatch_first,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)
@@ -747,8 +749,17 @@ def launch_gc_moe_ll(config, y, l1_weights, l2_weights, sym_buffer,
                      shared_l1_weights, shared_l2_weights, stats, *, direct_pull=True):
     route_grid = 1 if direct_pull else next(
         n for n in (8, 4, 2, 1) if config.local_experts % n == 0)
+    tuning = os.environ.get('GC_MOE_LL_TUNING', '1')
+    if tuning not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_TUNING must be 0 or 1')
+    # Measured GLM decode geometry; other shapes/direct-pull retain their
+    # existing launch policy. Disable for controlled legacy-LL comparisons.
+    dispatch_first = (tuning == '1' and not direct_pull and
+                      config.hidden == 6144 and config.intermediate == 2048 and
+                      config.local_experts == 8 and sym_buffer.num_topk == 8 and
+                      config.shared_experts == 1 and 0 < config.tokens <= 32)
     context = get_context(num_ranks=sym_buffer.group.size(), low_latency=True,
-                          ll_dispatch_sms=route_grid)
+                          ll_dispatch_sms=route_grid, ll_dispatch_first=dispatch_first)
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights, stats, context,

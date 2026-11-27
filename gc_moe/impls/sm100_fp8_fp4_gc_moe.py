@@ -276,7 +276,7 @@ class GCMoERoleKernel:
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, combine_geometry: tuple[int, int, int] | None = None,
                  routed_weight_linger: bool = False,
-                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1, direct_pipeline: bool = False):
+                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1, direct_pipeline: bool = False, dispatch_first: bool = False):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -293,6 +293,7 @@ class GCMoERoleKernel:
         if not 0 < nvlink_timeout_secs <= 2_147_483_647:
             raise ValueError('NVLink barrier timeout must fit positive INT_MAX seconds')
         self.l1_group = l1_group
+        self.dispatch_first = dispatch_first
         self.low_latency = low_latency
         self.direct_pull = direct_pull
         self.direct_pipeline = direct_pipeline
@@ -482,7 +483,11 @@ class GCMoERoleKernel:
                 cute.arch.alloc_tmem(self.tmem_cols, tptr, is_two_cta=True)
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
-        cute.arch.griddepcontrol_wait()
+        # A dispatch-first graph edge must not become a full dispatch wait.
+        # W1 acquires l1_full_count before its TMA loads, and shared input was
+        # staged before this graph. Other launch modes retain the usual wait.
+        if cutlass.const_expr(not (self.dispatch_first and self.role == 2)):
+            cute.arch.griddepcontrol_wait()
 
     @cute.jit
     def _role3_dispatch(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,

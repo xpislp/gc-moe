@@ -130,7 +130,7 @@ class RoleConfig:
 
 @lru_cache(maxsize=256)
 def get_role_config(role: int, block_m: int, num_experts: int,
-                    hidden: int, *, local_experts: int) -> RoleConfig:
+                    hidden: int, *, local_experts: int, dispatch_warps: int | None = None) -> RoleConfig:
     if role not in (1, 2, 3) or block_m not in CANDIDATE_BLOCK_M or block_m % 16:
         raise ValueError('invalid GC role/block M')
     pull_bytes = hidden
@@ -143,6 +143,10 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     # Large local expert tables need 96 registers per dispatch thread.
     # Keep that path within the per-SM register budget.
     routing_warps = (24 if local_experts <= 64 else 12) if block_m >= 96 else 8
+    if role == 1 and dispatch_warps is not None:
+        if dispatch_warps not in (8, 12, 16, 24):
+            raise ValueError('unsupported dispatch warp count')
+        routing_warps = dispatch_warps
     dispatch_threads = routing_warps * 32 if role == 1 else 128
     dispatch_warps = dispatch_threads // 32
     smem_cd = align(max(2 * store1 * 64 * 2, 2 * store2 * 128 * 2), 1024)
@@ -215,9 +219,10 @@ def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
 
 
 @lru_cache(maxsize=128)
-def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, direct_pull, direct_pipeline=False):
+def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, direct_pull, direct_pipeline=False, dispatch_warps=None):
     from dataclasses import replace
-    cfg = get_role_config(role, block_m, num_experts, hidden, local_experts=local_experts)
+    cfg = get_role_config(role, block_m, num_experts, hidden, local_experts=local_experts,
+                          dispatch_warps=dispatch_warps)
     if role != 2 or not direct_pull:
         return cfg
     # Cache already has the MMA layout; include the last SF read guard.

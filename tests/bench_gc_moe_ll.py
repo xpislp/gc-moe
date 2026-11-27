@@ -135,9 +135,13 @@ def main():
     p.add_argument('--repeats', type=int, default=7)
     p.add_argument('--graph-calls', type=int, default=20)
     p.add_argument('--warmup-graphs', type=int, default=20)
+    p.add_argument('--weight-rotations', type=int, default=0,
+                   help='Distinct-address weight sets to execute before each timed target call')
     p.add_argument('--profile', action='store_true')
     p.add_argument('--output', default='results/gc_moe_ll.json')
     args = p.parse_args()
+    if args.weight_rotations < 0:
+        p.error('--weight-rotations must be nonnegative')
     rank = int(os.environ.get('RANK', '0')); world = int(os.environ.get('WORLD_SIZE', '1'))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
     dist.init_process_group('nccl', device_id=torch.device('cuda', int(os.environ.get('LOCAL_RANK', '0'))))
@@ -159,26 +163,39 @@ def main():
                                 gran=128, shared_block=True)
                        for shape in ((2*i,h),(h,i)))
         sw = gc_moe.transform_weights_for_gc_moe(*shared)
+    weight_sets = [(weights, sw)]
+    for _ in range(args.weight_rotations):
+        weight_sets.append((tuple(tuple(t.clone() for t in pair) for pair in weights),
+            tuple(tuple(t.clone() for t in pair) if pair is not None else None for pair in sw)))
     variants = args.variants.split(',')
     results = []
     for tokens in map(int, args.tokens.split(',')):
         buffers = {v: gc_moe.get_symm_buffer_for_gc_moe(dist.group.WORLD,e,max(tokens,1),k,h,i,args.shared)
                    for v in variants}
         ys = {v: torch.empty((tokens,h),device=device,dtype=torch.bfloat16) for v in variants}
-        def call(v):
+        def call(v, weight_set=0):
+            current_weights, current_sw = weight_sets[weight_set]
             fn = gc_moe.fp8_fp4_gc_moe if v == 'gc' else gc_moe.fp8_fp4_gc_moe_ll
             kwargs = {} if v in ('gc', 'll') else dict(direct_pull=v in ('ll_direct', 'll_pipeline'))
+            previous_tuning = os.environ.get('GC_MOE_LL_TUNING')
+            if v == 'll_legacy':
+                os.environ['GC_MOE_LL_TUNING'] = '0'
             previous = os.environ.get('GC_MOE_LL_DIRECT_PIPELINE')
             if v in ('ll_direct', 'll_pipeline'):
                 os.environ['GC_MOE_LL_DIRECT_PIPELINE'] = '1' if v == 'll_pipeline' else '0'
             try:
-                fn(ys[v], *weights, buffers[v], *sw, shared_recipe=(1,128,128), **kwargs)
+                fn(ys[v], *current_weights, buffers[v], *current_sw, shared_recipe=(1,128,128), **kwargs)
             finally:
+                if previous_tuning is None:
+                    os.environ.pop('GC_MOE_LL_TUNING', None)
+                else:
+                    os.environ['GC_MOE_LL_TUNING'] = previous_tuning
                 if previous is None:
                     os.environ.pop('GC_MOE_LL_DIRECT_PIPELINE', None)
                 else:
                     os.environ['GC_MOE_LL_DIRECT_PIPELINE'] = previous
         graphs = {}
+        timing = {}
         for pattern_index, pattern in enumerate(args.patterns.split(',')):
             torch.manual_seed(1000 + rank + tokens + pattern_index * 10000)
             x = quantize(torch.randn((tokens,h),device=device)*.5)
@@ -195,6 +212,7 @@ def main():
                 idx = idx.masked_fill(mask,-1)
             prob = torch.randn((tokens,k),device=device).softmax(-1)
             expected = reference(dequant(x),idx,prob,raw,shared,rank,world)
+            stock_output = None
             for v in variants:
                 stage(buffers[v],x,idx,prob,tokens,e,world,k,v)
                 dist.barrier(); torch.cuda.synchronize()
@@ -203,14 +221,30 @@ def main():
                 errs = metrics(ys[v],expected)
                 if v not in graphs:
                     graph = torch.cuda.CUDAGraph()
+                    for w in range(1, len(weight_sets)): call(v, w)
+                    torch.cuda.synchronize()
+                    timing[v] = [(torch.cuda.Event(enable_timing=True, external=True),
+                                  torch.cuda.Event(enable_timing=True, external=True))
+                                 for _ in range(args.graph_calls)] if args.weight_rotations else []
                     with torch.cuda.graph(graph):
-                        for _ in range(args.graph_calls): call(v)
+                        for j in range(args.graph_calls):
+                            for w in range(1, len(weight_sets)): call(v, w)
+                            if timing[v]: timing[v][j][0].record()
+                            call(v)
+                            if timing[v]: timing[v][j][1].record()
                     graphs[v] = graph
                 # Replay a graph captured with old routing after changing its inputs.
                 for _ in range(max(3, args.warmup_graphs) if pattern == 'balanced' else 3): graphs[v].replay()
                 torch.cuda.synchronize()
                 errs = metrics(ys[v],expected)
-                results.append(dict(tokens=tokens,pattern=pattern,variant=v,accuracy=errs))
+                if v == 'gc':
+                    stock_output = ys[v].clone()
+                elif stock_output is not None:
+                    equal = torch.tensor(int(torch.equal(ys[v], stock_output)), device=device)
+                    dist.all_reduce(equal, op=dist.ReduceOp.MIN)
+                    assert equal.item() == 1, ('not bitwise equal to stock', tokens, pattern, v)
+                results.append(dict(tokens=tokens,pattern=pattern,variant=v,accuracy=errs,
+                    stock_bitwise_equal=True if stock_output is not None else None))
             if pattern == 'balanced' and args.profile:
                 for v in variants:
                     dist.barrier(); torch.cuda.synchronize()
@@ -227,7 +261,8 @@ def main():
                         dist.barrier(); torch.cuda.synchronize()
                         start,end = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
                         start.record(); graphs[v].replay(); end.record(); end.synchronize()
-                        us=torch.tensor(start.elapsed_time(end)*1000/args.graph_calls,device=device)
+                        elapsed = (sum(a.elapsed_time(b) for a,b in timing[v]) if timing[v] else start.elapsed_time(end))
+                        us=torch.tensor(elapsed*1000/args.graph_calls,device=device)
                         dist.all_reduce(us,op=dist.ReduceOp.MAX)
                         samples[v].append(us.item())
                 for v in variants:

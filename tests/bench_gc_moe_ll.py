@@ -100,7 +100,7 @@ def stage(buffer, x, idx, prob, tokens, experts, world, topk, variant):
     buffer.topk_weights[:tokens].copy_(prob)
     if buffer.num_shared_experts:
         query = gc_moe.get_block_m_for_gc_moe if variant == "gc" else gc_moe.get_block_m_for_gc_moe_ll
-        query_options = {} if variant == "gc" else dict(direct_pull=variant in ("ll_direct", "ll_pipeline"))
+        query_options = {} if variant in ("gc", "ll", "ll_noff", "ll_nopf", "ll_now1", "ll_ba", "ll_fp") else dict(direct_pull=variant in ("ll_direct", "ll_pipeline"))
         bm = query(world, experts, buffer.num_max_tokens_per_rank, tokens, topk, **query_options)
         rows = torch.arange(tokens, device='cuda')
         u = rows % bm
@@ -176,10 +176,25 @@ def main():
         def call(v, weight_set=0):
             current_weights, current_sw = weight_sets[weight_set]
             fn = gc_moe.fp8_fp4_gc_moe if v == 'gc' else gc_moe.fp8_fp4_gc_moe_ll
-            kwargs = {} if v in ('gc', 'll') else dict(direct_pull=v in ('ll_direct', 'll_pipeline'))
+            kwargs = {} if v in ('gc', 'll', 'll_noff', 'll_nopf', 'll_now1', 'll_ba', 'll_fp') else dict(direct_pull=v in ('ll_direct', 'll_pipeline'))
             previous_tuning = os.environ.get('GC_MOE_LL_TUNING')
             if v == 'll_legacy':
                 os.environ['GC_MOE_LL_TUNING'] = '0'
+            previous_ff = os.environ.get('GC_MOE_LL_FINALIZE_FIRST')
+            if v == 'll_noff':
+                os.environ['GC_MOE_LL_FINALIZE_FIRST'] = '0'
+            previous_pf = os.environ.get('GC_MOE_LL_W2_PREFETCH')
+            if v == 'll_nopf':
+                os.environ['GC_MOE_LL_W2_PREFETCH'] = '0'
+            previous_w1 = os.environ.get('GC_MOE_LL_W1_PREFETCH')
+            if v == 'll_now1':
+                os.environ['GC_MOE_LL_W1_PREFETCH'] = '0'
+            previous_ba = os.environ.get('GC_MOE_LL_B_AHEAD')
+            if v == 'll_ba':
+                os.environ['GC_MOE_LL_B_AHEAD'] = '1'
+            previous_fp = os.environ.get('GC_MOE_LL_FAST_PUB')
+            if v == 'll_fp':
+                os.environ['GC_MOE_LL_FAST_PUB'] = '1'
             previous = os.environ.get('GC_MOE_LL_DIRECT_PIPELINE')
             if v in ('ll_direct', 'll_pipeline'):
                 os.environ['GC_MOE_LL_DIRECT_PIPELINE'] = '1' if v == 'll_pipeline' else '0'
@@ -190,6 +205,26 @@ def main():
                     os.environ.pop('GC_MOE_LL_TUNING', None)
                 else:
                     os.environ['GC_MOE_LL_TUNING'] = previous_tuning
+                if previous_ff is None:
+                    os.environ.pop('GC_MOE_LL_FINALIZE_FIRST', None)
+                else:
+                    os.environ['GC_MOE_LL_FINALIZE_FIRST'] = previous_ff
+                if previous_pf is None:
+                    os.environ.pop('GC_MOE_LL_W2_PREFETCH', None)
+                else:
+                    os.environ['GC_MOE_LL_W2_PREFETCH'] = previous_pf
+                if previous_w1 is None:
+                    os.environ.pop('GC_MOE_LL_W1_PREFETCH', None)
+                else:
+                    os.environ['GC_MOE_LL_W1_PREFETCH'] = previous_w1
+                if previous_ba is None:
+                    os.environ.pop('GC_MOE_LL_B_AHEAD', None)
+                else:
+                    os.environ['GC_MOE_LL_B_AHEAD'] = previous_ba
+                if previous_fp is None:
+                    os.environ.pop('GC_MOE_LL_FAST_PUB', None)
+                else:
+                    os.environ['GC_MOE_LL_FAST_PUB'] = previous_fp
                 if previous is None:
                     os.environ.pop('GC_MOE_LL_DIRECT_PIPELINE', None)
                 else:

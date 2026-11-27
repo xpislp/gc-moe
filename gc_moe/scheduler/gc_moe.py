@@ -21,8 +21,10 @@ from ..ptx.ld_st import (
     atom_add_u32,
     st_async_cluster_u32x4,
 )
+from ..ptx.tma import prefetch_g2s_4d
 from ..ptx.utils import (
     elect_one_sync,
+    read_clock64,
     warp_first_set_bit,
 )
 
@@ -39,6 +41,50 @@ TASK_WORDS = 8
 TASK_BYTES = 32
 SCHEDULE_STAGES = 2
 TASK_EMPTY_CONSUMERS = 512
+
+
+@cute.jit
+def prefetch_w2_tiles(w2_map: cute.Pointer, n_cluster: Uint32, expert: Uint32,
+                      lane: Uint32,
+                      k_blocks: cutlass.Constexpr) -> None:
+    """L2-prefetch the W2 tiles a cluster pair will TMA for one task.
+
+    Lanes cover the task's two N tiles (leader and peer CTA) times its
+    k_blocks K tiles, so a typical shape issues one fire-and-forget
+    instruction per lane. The producer warp would otherwise first touch
+    gmem only after the task's Linear1 output lands.
+    """
+    lane_tile = lane
+    while lane_tile < Uint32(2 * k_blocks):
+        n_block = n_cluster * Uint32(2) + (lane_tile % Uint32(2))
+        k_block = lane_tile // Uint32(2)
+        prefetch_g2s_4d(w2_map, Uint32(0), n_block * Uint32(128),
+                        k_block, expert)
+        lane_tile += Uint32(32)
+
+
+@cute.jit
+def prefetch_w1_prefix(w1_map: cute.Pointer, cluster: Uint32, lane: Uint32,
+                       kb_blocks: cutlass.Constexpr,
+                       n_blocks: cutlass.Constexpr,
+                       experts: cutlass.Constexpr,
+                       sched_threads: cutlass.Constexpr) -> None:
+    """Prefetch the first experts' routed W1 tiles while dispatch runs.
+
+    The scheduler issues these fire-and-forget before waiting on receive
+    counts, harvesting otherwise-idle DRAM during the role1 window. Every
+    tile is one the loader warps fetch anyway, so total traffic is
+    unchanged and the later TMA loads hit L2 instead of gmem.
+    """
+    tile = cluster * Uint32(32) + lane
+    while tile < Uint32(kb_blocks * n_blocks * experts):
+        expert = tile // Uint32(kb_blocks * n_blocks)
+        rem = tile % Uint32(kb_blocks * n_blocks)
+        n_block = rem // Uint32(kb_blocks)
+        k_block = rem % Uint32(kb_blocks)
+        prefetch_g2s_4d(w1_map, Uint32(0), n_block * Uint32(128),
+                        k_block, expert)
+        tile += Uint32(sched_threads)
 
 
 @cute.jit
@@ -104,7 +150,9 @@ def publish_shared_phase(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
                          n_clusters: cutlass.Constexpr,
                          num_compute_sms: cutlass.Constexpr,
                          shape_n: cutlass.Constexpr,
-                         shape_k: cutlass.Constexpr) -> Uint32:
+                         shape_k: cutlass.Constexpr,
+                         w2_map: cute.Pointer = None,
+                         w2_prefetch: cutlass.Constexpr = 0) -> Uint32:
     """Reference shared_mainloop: static one task/cluster, else global claims."""
     m_blocks = (num_tokens + Uint32(block_m - 1)) // Uint32(block_m)
     total = m_blocks * Uint32(n_clusters)
@@ -114,6 +162,9 @@ def publish_shared_phase(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
             m_block = cluster_idx // Uint32(n_clusters)
             n_cluster = cluster_idx % Uint32(n_clusters)
             valid_m = min(Uint32(block_m), Uint32(num_tokens) - m_block * Uint32(block_m))
+            if cutlass.const_expr(w2_prefetch):
+                prefetch_w2_tiles(w2_map, n_cluster, Uint32(0),
+                                  Uint32(lane), shape_k // 128)
             publish_iteration(task_ptr, full_ptr, iteration,
                               lane, phase, Uint32(0), m_block, n_cluster, m_block,
                               valid_m, Uint32(shape_n), Uint32(shape_k))
@@ -131,6 +182,9 @@ def publish_shared_phase(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
                 m_block = task_idx // Uint32(n_clusters)
                 n_cluster = task_idx % Uint32(n_clusters)
                 valid_m = min(Uint32(block_m), Uint32(num_tokens) - m_block * Uint32(block_m))
+                if cutlass.const_expr(w2_prefetch):
+                    prefetch_w2_tiles(w2_map, n_cluster, Uint32(0),
+                                      Uint32(lane), shape_k // 128)
                 publish_iteration(task_ptr, full_ptr, iteration,
                                   lane, phase, Uint32(0), m_block, n_cluster, m_block,
                                   valid_m, Uint32(shape_n), Uint32(shape_k))
@@ -216,8 +270,19 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    num_ranks: cutlass.Constexpr,
                    shared_experts: cutlass.Constexpr,
                    l1_group: cutlass.Constexpr = 1,
+                   routed_w2_map: cute.Pointer = None,
+                   shared_w2_map: cute.Pointer = None,
+                   w2_prefetch: cutlass.Constexpr = 0,
+                   routed_w1_map: cute.Pointer = None,
+                   w1_prefetch: cutlass.Constexpr = 0,
+                   w1_prefetch_experts: cutlass.Constexpr = 0,
+                   sched_trace: cutlass.Constexpr = 0,
 ) -> None:
     """Publish shared and interleaved routed tasks, then the end sentinel."""
+    if cutlass.const_expr(sched_trace):
+        r2s_t0 = read_clock64()
+        r2s_l1 = Uint64(0)
+        r2s_l2 = Uint64(0)
     shared_m_blocks = (num_tokens + Uint32(block_m - 1)) // \
         Uint32(block_m)
     shared_l2_early = (shared_m_blocks * Uint32(l2_clusters) <=
@@ -238,7 +303,16 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 Uint32(GCBlockPhase.SharedLinear2),
                 num_tokens, block_m, l2_clusters,
                 compute_sms, hidden,
-                intermediate * shared_experts)
+                intermediate * shared_experts,
+                shared_w2_map, w2_prefetch)
+    if cutlass.const_expr(w1_prefetch):
+        # Issue before the receive-count poll: role1 is still routing, and
+        # only the shared stage's TMA competes for DRAM in this window.
+        prefetch_w1_prefix(routed_w1_map, Uint32(block // 2), Uint32(lane),
+                           hidden // 128, 2 * intermediate // 128,
+                           w1_prefetch_experts, (compute_sms // 2) * 32)
+    if cutlass.const_expr(sched_trace):
+        r2s_shared = read_clock64()
     # Each lane owns experts wave*32+lane in registers, as in
     # GCMoEScheduler. The count cache survives routed L1/L2 task
     # claims, without an E-dependent shared prefix allocation.
@@ -253,6 +327,8 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
             count = ld_acquire_sys_u64(recv_ptr + local_expert * 2)
         expert_counts[wave] = Uint32(count)
     cute.arch.sync_warp()
+    if cutlass.const_expr(sched_trace):
+        r2s_counts = read_clock64()
     lane_m_blocks = Uint32(0)
     for wave in cutlass.range_constexpr(
             (local_experts + 31) // 32):
@@ -308,6 +384,9 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                                               m_block, n_cluster + Uint32(offset), pool_block, valid_m,
                                               Uint32(2 * intermediate), Uint32(hidden))
                             iteration = Uint32(iteration + Uint32(1))
+                    if cutlass.const_expr(sched_trace):
+                        if r2s_l1 == Uint64(0):
+                            r2s_l1 = read_clock64()
                     fetching = False
             else:
                 task_idx = claim_task(l2_count_ptr, Int32(lane))
@@ -324,6 +403,13 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                             expert_counts, pool_block, Uint32(lane),
                             local_experts, block_m)
                     required_l1 = (pool_block + 1) * l1_tasks
+                    if cutlass.const_expr(w2_prefetch):
+                        # The producer first waits the task's Linear1 output
+                        # mask before its first W2 TMA; move that gmem fetch
+                        # into the Linear1 phase instead.
+                        prefetch_w2_tiles(routed_w2_map, n_cluster,
+                                          local_expert, Uint32(lane),
+                                          intermediate // 128)
                     while ld_volatile_u32(l1_count_ptr) < required_l1:
                         pass
                     publish_iteration(task, full, iteration, Int32(lane),
@@ -331,6 +417,9 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                                       m_block, n_cluster, pool_block, valid_m,
                                       Uint32(hidden), Uint32(intermediate))
                     iteration = Uint32(iteration + Uint32(1))
+                    if cutlass.const_expr(sched_trace):
+                        if r2s_l2 == Uint64(0):
+                            r2s_l2 = read_clock64()
                     fetching = False
     if cutlass.const_expr(shared_experts > 0):
         if not shared_l2_early:
@@ -340,9 +429,19 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 Uint32(GCBlockPhase.SharedLinear2),
                 num_tokens, block_m, l2_clusters,
                 compute_sms, hidden,
-                intermediate * shared_experts)
+                intermediate * shared_experts,
+                shared_w2_map, w2_prefetch)
     wait_task_slot(empty, iteration)
     publish_iteration(task, full, iteration, Int32(lane),
                       Uint32(GCBlockPhase.None_), Uint32(0),
                       Uint32(0), Uint32(0),
                       Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+    if cutlass.const_expr(sched_trace):
+        if lane == Int32(0):
+            cute.printf('TRACE_R2S c0={} shared={} counts={} l1={} l2={} end={}\n',
+                        Uint32(r2s_t0 & Uint64(0xffffffff)),
+                        Uint32(r2s_shared - r2s_t0),
+                        Uint32(r2s_counts - r2s_t0),
+                        Uint32(r2s_l1 - r2s_t0),
+                        Uint32(r2s_l2 - r2s_t0),
+                        Uint32(read_clock64() - r2s_t0))

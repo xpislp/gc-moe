@@ -297,7 +297,8 @@ def _rewrite_value_formal(ptx: str, ordinal: int, value_bytes: int,
     return ptx
 
 
-def _convert_role2_map_uses(ptx: str, map_count: int) -> str:
+def _convert_role2_map_uses(ptx: str, map_count: int,
+                           sched_prefetch: bool = False) -> str:
     """Convert early prefetches and W1 output stores at PTX instruction uses.
 
     CuTe exposes map parameters as pointers. After the by-value formal rewrite
@@ -305,6 +306,8 @@ def _convert_role2_map_uses(ptx: str, map_count: int) -> str:
     Loader warps convert their two selected maps once per task before the K
     loop. This bridge converts only the earlier prefetches and the per-store
     W1 output map, which the reference also selects inside its elected store.
+    With LL scheduler weight prefetch enabled it also converts the scheduler
+    warp's fire-and-forget tensor prefetches.
     Every conversion is scalar; no elected lane executes a warp collective.
 
     Fail closed on changes to CuTe's generated descriptor instruction forms.
@@ -338,9 +341,30 @@ def _convert_role2_map_uses(ptx: str, map_count: int) -> str:
     s2g = re.compile(
         r"(?m)^([ \t]*cp\.async\.bulk\.tensor\.2d\.global\.shared"
         r"[^\n]*?\[)(%rd[0-9]+)(,[ \t]*\{[^\n]+)$")
+    w2pf = re.compile(
+        r"(?m)^([ \t]*cp\.async\.bulk\.prefetch\.tensor\.4d\.L2\.global"
+        r"\.tile[ \t]+\[)(%rd[0-9]+)(,[ \t]*\{[^\n]+)$")
     prefetch_regs = [m.group(2) for m in prefetch.finditer(ptx)]
     if len(prefetch_regs) != map_count or set(prefetch_regs) != set(raw_map_regs):
         raise RuntimeError('role2 TensorMap prefetch set changed')
+    w2pf_regs = [m.group(2) for m in w2pf.finditer(ptx)]
+    # The weight-loader's b_ahead prefetch selects its map by task phase;
+    # the compiler materializes that phi as one selp.b64 over raw map
+    # registers, which still holds a param-space address at the use.
+    selp_defs = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(
+        r"(?m)^[ \t]*selp\.b64[ \t]+(%rd[0-9]+),[ \t]*(%rd[0-9]+),"
+        r"[ \t]*(%rd[0-9]+),[ \t]*%p[0-9]+;[ \t]*$", ptx)}
+    def map_holding(reg: str, depth: int = 0) -> bool:
+        if reg in raw_map_regs:
+            return True
+        if depth >= 4 or reg not in selp_defs:
+            return False
+        return all(map_holding(src, depth + 1) for src in selp_defs[reg])
+    if sched_prefetch:
+        if not w2pf_regs or not all(map_holding(r) for r in w2pf_regs):
+            raise RuntimeError('role2 W2 prefetch map set changed')
+    elif w2pf_regs:
+        raise RuntimeError('role2 W2 prefetch survived its disabled build')
     tensor_op_count = len(re.findall(
         r"(?m)^[ \t]*cp\.async\.bulk\.tensor\.", ptx))
     g2s_count = len(list(g2s.finditer(ptx)))
@@ -371,10 +395,11 @@ def _convert_role2_map_uses(ptx: str, map_count: int) -> str:
 
     ptx = prefetch.sub(converted_use, ptx)
     ptx = s2g.sub(converted_use, ptx)
+    ptx = w2pf.sub(converted_use, ptx)
     ptx = register_decl.sub(
         lambda m: m.group(1) + str(next_reg) + m.group(3), ptx, count=1)
     if len(re.findall(r"\bcvta\.param\.u64\b", ptx)) != \
-            source_cvta_count + map_count + s2g_count:
+            source_cvta_count + map_count + s2g_count + len(w2pf_regs):
         raise RuntimeError('role2 TensorMap conversion count changed')
     return ptx
 
@@ -425,6 +450,7 @@ def _order_role2_value_formals(ptx: str, map_count: int) -> str:
 def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
                                 use_small_tile_path: bool,
+                                sched_prefetch: bool = False,
                                 ptxas_options: tuple[str, ...] = PTXAS_OPTIONS) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus role2's value maps."""
     map_count = 22 if use_small_tile_path else 18
@@ -452,7 +478,7 @@ def _assemble_role_value_params(ptx: str, role: int,
         for map_ordinal in (4, *range(7, map_count + 6)):
             ptx = _rewrite_value_formal(
                 ptx, map_ordinal, 128, 128, raw_param_address=True)
-        ptx = _convert_role2_map_uses(ptx, map_count)
+        ptx = _convert_role2_map_uses(ptx, map_count, sched_prefetch)
         ptx = _order_role2_value_formals(ptx, map_count)
     return assemble_ptx(ptx, dump_dir, f"role{role}_value_params",
                                 target=target, ptxas_options=ptxas_options)
@@ -616,7 +642,45 @@ def prepare_role_binaries(config, y: torch.Tensor,
     l1_group = int(os.environ.get('GC_MOE_LL_L1_GROUP', '2')) if low_latency and direct_pull else 1
     if l1_group not in (1, 2, 4, 8):
         raise ValueError('GC_MOE_LL_L1_GROUP must be 1, 2, 4 or 8')
-    key = (key, low_latency, direct_pull, l1_group, direct_pipeline, context.dispatch_first)
+    w2_prefetch_env = os.environ.get('GC_MOE_LL_W2_PREFETCH', '0')
+    if w2_prefetch_env not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_W2_PREFETCH must be 0 or 1')
+    # Claim-time W2 L2 prefetch measured 4-7% slower end-to-end on the GLM
+    # shapes: the Linear1 phase already saturates DRAM, so the extra fetches
+    # only add L2/TMA queue contention. It stays opt-in for research.
+    w2_prefetch = w2_prefetch_env == '1' and low_latency
+    w1_prefetch_env = os.environ.get('GC_MOE_LL_W1_PREFETCH', '0')
+    if w1_prefetch_env not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_W1_PREFETCH must be 0 or 1')
+    w1_experts_env = os.environ.get('GC_MOE_LL_W1_PREFETCH_EXPERTS', '2')
+    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", w1_experts_env, re.ASCII) is None \
+            or int(w1_experts_env) < 0:
+        raise ValueError('GC_MOE_LL_W1_PREFETCH_EXPERTS must be a nonnegative int')
+    # The scheduler warp prefetches the first experts' W1 tiles before its
+    # receive-count poll, filling DRAM left idle while role1 routes.
+    w1_prefetch = w1_prefetch_env == '1' and low_latency
+    w1_prefetch_experts = min(int(w1_experts_env), config.local_experts) \
+        if w1_prefetch else 0
+    # Diagnostic-only build: scheduler/producer/role1 clock64 phase stamps.
+    # printf perturbs timing; never use it for A/B measurement runs.
+    sched_trace = os.environ.get('GC_MOE_LL_SCHED_TRACE', '0') == '1'
+    b_ahead_env = os.environ.get('GC_MOE_LL_B_AHEAD', '0')
+    if b_ahead_env not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_B_AHEAD must be 0 or 1')
+    # The weight-loader warp L2-prefetches a Linear1 task's W1 tiles beyond
+    # the stage depth while warp 0 still waits the pool fill, draining the
+    # DRAM window left idle between the shared stream and the routed stream.
+    b_ahead = b_ahead_env == '1' and low_latency and not direct_pull
+    fast_pub_env = os.environ.get('GC_MOE_LL_FAST_PUB', '0')
+    if fast_pub_env not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_FAST_PUB must be 0 or 1')
+    # The dispatch grid's cross-CTA barrier is redundant in the LL route
+    # partition: each expert's owning CTA writes its source indices and
+    # publishes its count, so a thread barrier carries the ordering.
+    fast_pub = fast_pub_env == '1' and low_latency
+    key = (key, low_latency, direct_pull, l1_group, direct_pipeline,
+           context.dispatch_first, context.finalize_first, w2_prefetch,
+           w1_prefetch, w1_prefetch_experts, sched_trace, b_ahead, fast_pub)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -659,6 +723,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         routed_weight_linger=routed_weight_linger,
                         low_latency=low_latency, direct_pull=direct_pull, l1_group=l1_group,
                         direct_pipeline=direct_pipeline, dispatch_first=context.dispatch_first,
+                        w2_prefetch=w2_prefetch, w1_prefetch=w1_prefetch,
+                        w1_prefetch_experts=w1_prefetch_experts,
+                        sched_trace=sched_trace, b_ahead=b_ahead,
+                        fast_pub=fast_pub,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)
@@ -696,6 +764,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, role, dump_dir, target=compiler_target,
                                 use_small_tile_path=small_tile_path,
+                                sched_prefetch=w1_prefetch or w2_prefetch or b_ahead,
                                 ptxas_options=compiler_identity.ptxas_options))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
@@ -752,6 +821,13 @@ def launch_gc_moe_ll(config, y, l1_weights, l2_weights, sym_buffer,
     tuning = os.environ.get('GC_MOE_LL_TUNING', '1')
     if tuning not in ('0', '1'):
         raise ValueError('GC_MOE_LL_TUNING must be 0 or 1')
+    finalize_env = os.environ.get('GC_MOE_LL_FINALIZE_FIRST', '0')
+    if finalize_env not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_FINALIZE_FIRST must be 0 or 1')
+    # Early finalize-grid admission measured 1-2% slower at T<=8 and neutral
+    # at larger T on the GLM shapes, so it stays opt-in. The kernels are
+    # unchanged either way; the finalize role keeps its griddepcontrol wait.
+    finalize_first = finalize_env == '1' and not direct_pull
     # Measured GLM decode geometry; other shapes/direct-pull retain their
     # existing launch policy. Disable for controlled legacy-LL comparisons.
     dispatch_first = (tuning == '1' and not direct_pull and
@@ -759,7 +835,8 @@ def launch_gc_moe_ll(config, y, l1_weights, l2_weights, sym_buffer,
                       config.local_experts == 8 and sym_buffer.num_topk == 8 and
                       config.shared_experts == 1 and 0 < config.tokens <= 32)
     context = get_context(num_ranks=sym_buffer.group.size(), low_latency=True,
-                          ll_dispatch_sms=route_grid, ll_dispatch_first=dispatch_first)
+                          ll_dispatch_sms=route_grid, ll_dispatch_first=dispatch_first,
+                          ll_finalize_first=finalize_first)
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights, stats, context,

@@ -88,6 +88,7 @@ from ..ptx.tma import (
     bulk_g2s_1d,
     bulk_s2g_1d,
     generic_tensormap_ptr,
+    prefetch_g2s_4d,
     prefetch_tensormap,
     tile_s2g_2d,
     tma_store_arrive,
@@ -276,7 +277,10 @@ class GCMoERoleKernel:
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, combine_geometry: tuple[int, int, int] | None = None,
                  routed_weight_linger: bool = False,
-                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1, direct_pipeline: bool = False, dispatch_first: bool = False):
+                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1, direct_pipeline: bool = False, dispatch_first: bool = False,
+                 w2_prefetch: bool = False, w1_prefetch: bool = False,
+                 w1_prefetch_experts: int = 0, sched_trace: bool = False,
+                 b_ahead: bool = False, fast_pub: bool = False):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -294,6 +298,12 @@ class GCMoERoleKernel:
             raise ValueError('NVLink barrier timeout must fit positive INT_MAX seconds')
         self.l1_group = l1_group
         self.dispatch_first = dispatch_first
+        self.w2_prefetch = w2_prefetch
+        self.w1_prefetch = w1_prefetch
+        self.w1_prefetch_experts = w1_prefetch_experts
+        self.sched_trace = sched_trace
+        self.b_ahead = b_ahead
+        self.fast_pub = fast_pub
         self.low_latency = low_latency
         self.direct_pull = direct_pull
         self.direct_pipeline = direct_pipeline
@@ -752,6 +762,8 @@ class GCMoERoleKernel:
             pull_bar = cute.recast_ptr(slab + self.shared_layout.dispatch_bars, dtype=Uint64)
             self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
             warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
+            if cutlass.const_expr(self.sched_trace):
+                r1_t0 = read_clock64()
             # Dual-buffered receive signals: replay N publishes and reads
             # generation parity & 1; role 3 flips the persistent parity
             # word after consuming each replay, and the replay that retires
@@ -851,7 +863,13 @@ class GCMoERoleKernel:
                                    Uint32(4)), cute.AddressSpace.gmem)
                         dst_index[0] = token_topk
                 cute.arch.sync_warp()
-            if cutlass.const_expr(self.low_latency and self.dispatch_sms == 1):
+            if cutlass.const_expr(self.low_latency and
+                                  (self.dispatch_sms == 1 or self.fast_pub)):
+                # LL routes each global expert to one owning CTA
+                # (expert % dispatch_sms == block), which performs both that
+                # expert's source-index writes and its count publish. A CTA
+                # never publishes another CTA's writes, so a thread barrier
+                # replaces the cross-CTA grid rendezvous.
                 cute.arch.sync_threads()
             else:
                 grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
@@ -936,6 +954,8 @@ class GCMoERoleKernel:
                         recv_ptr + expert_idx * Uint32(2))
                 expert_counts[wave] = Uint32(observed)
             cute.arch.sync_warp()
+            if cutlass.const_expr(self.sched_trace):
+                r1_counts = read_clock64()
 
             if block == Uint32(0) and physical_warp == Uint32(0):
                 own_pool_blocks = Uint32(0)
@@ -1164,6 +1184,13 @@ class GCMoERoleKernel:
                             expert_counts, token_idx, current_expert, expert_start,
                             expert_end, pool_block_offset, lane, self.local_experts,
                             self.block_m)
+            if cutlass.const_expr(self.sched_trace):
+                if block == Uint32(0):
+                    cute.printf('TRACE_R1 w{} c0={} counts={} done={}\n',
+                                physical_warp,
+                                Uint32(r1_t0 & Uint64(0xffffffff)),
+                                Uint32(r1_counts - r1_t0),
+                                Uint32(read_clock64() - r1_t0))
         elif cutlass.const_expr(self.role == 2):
             if physical_warp == 0:
                 # Each descriptor has its own aligned by-value kernel
@@ -1230,6 +1257,14 @@ class GCMoERoleKernel:
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)
             if cta_rank == 0 and physical_warp == 3:
+                # Raw param-space map pointers; the scheduler warp prefetches
+                # each L2 task's W2 tiles into L2 while Linear1 still computes.
+                # The PTX bridge converts these uses like the loader's.
+                routed_w2_map = tensor_map_7.iterator
+                shared_w2_map = routed_w2_map
+                if cutlass.const_expr(self.shared_experts > 0):
+                    shared_w2_map = tensor_map_16.iterator
+                routed_w1_map = tensor_map_2.iterator
                 schedule_tasks(
                     task, full, empty, recv_ptr, l1_count_ptr, l2_count_ptr,
                     shared_l1_count_ptr, shared_l2_count_ptr, expert_counts,
@@ -1245,6 +1280,9 @@ class GCMoERoleKernel:
                     self.num_ranks,
                     self.shared_experts,
                     self.l1_group,
+                    routed_w2_map, shared_w2_map, self.w2_prefetch,
+                    routed_w1_map, self.w1_prefetch, self.w1_prefetch_experts,
+                    self.sched_trace,
                 )
             # The same two-slot task stream drives both TMA producer warps
             # and the leader MMA warp. All three consume every valid phase.
@@ -1254,6 +1292,10 @@ class GCMoERoleKernel:
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
                 cached_pool = Uint32(0xffffffff)
+                if cutlass.const_expr(self.sched_trace):
+                    r2p_t0 = read_clock64()
+                    r2p_task = Uint64(0)
+                    r2p_a = Uint64(0)
                 if cutlass.const_expr(self.direct_pipeline):
                     peer_x_sources = cute.make_rmem_tensor((self.block_m // 8,), Uint64)
                     peer_sf_sources = cute.make_rmem_tensor((self.block_m // 8,), Uint64)
@@ -1264,6 +1306,10 @@ class GCMoERoleKernel:
                                             (task_iter // Uint32(2)) % Uint32(2))
                     task_phase = task_words[task_stage * 8]
                     running = task_phase != Uint32(GCBlockPhase.None_)
+                    if cutlass.const_expr(self.sched_trace):
+                        if task_phase == Uint32(GCBlockPhase.Linear1) and \
+                                r2p_task == Uint64(0):
+                            r2p_task = read_clock64()
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
@@ -1325,6 +1371,9 @@ class GCMoERoleKernel:
                                 (pool_block // Uint32(self.ring_blocks) + Uint32(1))
                             while ld_acquire_gpu_u32(l1_full_ptr) != required:
                                 pass
+                            if cutlass.const_expr(self.sched_trace):
+                                if r2p_a == Uint64(0):
+                                    r2p_a = read_clock64()
                             if cutlass.const_expr(self.direct_pull):
                                 if cached_pool != pool_block:
                                     if cached_pool != Uint32(0xffffffff):
@@ -1443,6 +1492,13 @@ class GCMoERoleKernel:
                             data_phase ^= Uint32(data_stage == Uint32(0))
                             k_block += Uint32(1)
                     task_iter += Uint32(1)
+                if cutlass.const_expr(self.sched_trace):
+                    if cta_rank == Uint32(0) and lane == Uint32(0):
+                        cute.printf('TRACE_R2P c0={} task={} a={} end={}\n',
+                                    Uint32(r2p_t0 & Uint64(0xffffffff)),
+                                    Uint32(r2p_task - r2p_t0),
+                                    Uint32(r2p_a - r2p_t0),
+                                    Uint32(read_clock64() - r2p_t0))
             elif physical_warp == 1:
                 task_words = cute.make_tensor(task, cute.make_layout((16,)))
                 task_iter = Uint32(0)
@@ -1489,6 +1545,29 @@ class GCMoERoleKernel:
                                 activation_sf_map = tensor_map_15.iterator
                                 weight_map = tensor_map_16.iterator
                                 weight_sf_map = tensor_map_17.iterator
+                        if cutlass.const_expr(self.b_ahead):
+                            if task_phase == Uint32(GCBlockPhase.Linear1):
+                                l1_full_ptr = signals.iterator + \
+                                    SIGNAL_OFFSETS['l1_full_count'] // 4 + block_idx
+                                required = self.block_m * \
+                                    (pool_block // Uint32(self.ring_blocks) + Uint32(1))
+                                if ld_volatile_u32(l1_full_ptr) != required:
+                                    # Warp 0 still spins on the pool fill here,
+                                    # leaving DRAM idle. The weight tiles this
+                                    # task will TMA anyway, beyond the stage
+                                    # depth the pipeline can absorb now, are
+                                    # issued as fire-and-forget L2 prefetches
+                                    # so the later loads hit L2 instead. The
+                                    # raw map pointer keeps the PTX bridge's
+                                    # param-space conversion in charge.
+                                    pf_k = Uint32(self.math_stages) + Uint32(lane)
+                                    pf_k_blocks = shape_k // Uint32(128)
+                                    while pf_k < pf_k_blocks:
+                                        prefetch_g2s_4d(
+                                            weight_map, Uint32(0),
+                                            (n_cluster * Uint32(2) + cta_rank) *
+                                            Uint32(128), pf_k, local_expert)
+                                        pf_k += Uint32(32)
                         weight_map = generic_tensormap_ptr(weight_map)
                         weight_sf_map = generic_tensormap_ptr(weight_sf_map)
                         k_block = Uint32(0)

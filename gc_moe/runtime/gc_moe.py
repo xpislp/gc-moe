@@ -202,6 +202,15 @@ def _runtime_locked(function):
     return locked
 
 
+def _launch_order_edge() -> cu.CUgraphEdgeData:
+    """Programmatic launch-order edge: dependent CTAs admit once the
+    predecessor's CTAs have launched, without waiting for completion."""
+    edge = cu.CUgraphEdgeData()
+    edge.from_port = cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER
+    edge.type = int(cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC)
+    return edge
+
+
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
                  arguments: Sequence[_KernelArgs]):
@@ -242,10 +251,15 @@ class _ChildGraph:
                     # remaining SMs. This is launch ordering, not completion:
                     # the compute worker acquires each ready input separately.
                     dependencies = [nodes[0]]
-                    edge = cu.CUgraphEdgeData()
-                    edge.from_port = cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER
-                    edge.type = int(cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC)
-                    edge_data = [edge]
+                    edge_data = [_launch_order_edge()]
+                elif index == 2 and owner.finalize_first:
+                    # Admit finalize CTAs while dispatch/compute still run so
+                    # their prologue (and SM residency once dispatch retires)
+                    # overlaps the compute tail. The finalize kernel keeps its
+                    # griddepcontrol wait, so it still observes full
+                    # predecessor completion before consuming any signal.
+                    dependencies = nodes[:2]
+                    edge_data = [_launch_order_edge(), _launch_order_edge()]
                 node = _ok(cu.cuGraphAddNode(self.graph, dependencies, edge_data,
                                              len(dependencies), params))
                 if index == 1:
@@ -292,7 +306,7 @@ class GreenContextPair:
     def __init__(self, device_index: int | None = None,
                  requested_dispatch_sms: int | None = None, *,
                  num_ranks: int = 1, low_latency: bool = False, ll_dispatch_sms: int = 1,
-                 ll_dispatch_first: bool = False):
+                 ll_dispatch_first: bool = False, ll_finalize_first: bool = False):
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         requested_dispatch_sms = _get_requested_dispatch_sms(
@@ -301,6 +315,7 @@ class GreenContextPair:
         self.primary_context = _ok(cu.cuCtxGetCurrent())
         ll_green = low_latency and _get_env_int('GC_MOE_LL_USE_GREEN', 0) != 0
         self.dispatch_first = low_latency and not ll_green and ll_dispatch_first
+        self.finalize_first = low_latency and not ll_green and ll_finalize_first
         self.primary_ctx_roles = ((low_latency and not ll_green) or
                                   (not low_latency and _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0))
         if device_index is None:
@@ -560,7 +575,7 @@ class _ThreadContexts:
 
 
 def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: int = 1,
-                ll_dispatch_first: bool = False) -> GreenContextPair:
+                ll_dispatch_first: bool = False, ll_finalize_first: bool = False) -> GreenContextPair:
     requested_dispatch_sms = _get_requested_dispatch_sms(num_ranks)
     current = _ok(cu.cuCtxGetCurrent())
     holder = getattr(_THREAD_LOCAL, 'holder', None)
@@ -570,13 +585,14 @@ def get_context(*, num_ranks: int, low_latency: bool = False, ll_dispatch_sms: i
     # Calls in different process groups may need different SM budgets even
     # on the same CUDA context. Reuse only the same effective SM request.
     key = (int(current), requested_dispatch_sms, low_latency, ll_dispatch_sms, ll_dispatch_first,
+           ll_finalize_first,
            _get_env_int('GC_MOE_LL_USE_GREEN', 0) if low_latency else 0,
            _get_env_int('GC_MOE_LL_COMPUTE_SMS', 0) if low_latency else 0)
     if key not in contexts or contexts[key]._state == 'closed':
         contexts[key] = GreenContextPair(
             requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks,
             low_latency=low_latency, ll_dispatch_sms=ll_dispatch_sms,
-            ll_dispatch_first=ll_dispatch_first)
+            ll_dispatch_first=ll_dispatch_first, ll_finalize_first=ll_finalize_first)
     elif contexts[key]._state != 'open':
         raise RuntimeError(f"cached Green context pair is {contexts[key]._state}")
     return contexts[key]

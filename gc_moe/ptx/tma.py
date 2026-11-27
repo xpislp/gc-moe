@@ -272,3 +272,11 @@ def copy_wait_six(*, loc=None, ip=None):
     """Bound the gather to six outstanding committed cp.async groups."""
     llvm.inline_asm(None, [], 'cp.async.wait_group 6;', '~{memory}',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_wait_groups(pending: int, *, loc=None, ip=None):
+    if not 0 <= pending <= 7:
+        raise ValueError("cp.async permits 0..7 pending groups")
+    llvm.inline_asm(None, [], f'cp.async.wait_group {pending};', '~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)

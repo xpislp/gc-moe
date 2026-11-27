@@ -215,7 +215,7 @@ def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
 
 
 @lru_cache(maxsize=128)
-def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, direct_pull):
+def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, direct_pull, direct_pipeline=False):
     from dataclasses import replace
     cfg = get_role_config(role, block_m, num_experts, hidden, local_experts=local_experts)
     if role != 2 or not direct_pull:
@@ -227,7 +227,7 @@ def get_ll_role_config(role, block_m, num_experts, hidden, *, local_experts, dir
             store_m_l1=cfg.store_m_l1, store_m_l2=cfg.store_m_l2,
             dispatch_warps=cfg.routing_warps,
             block_n=128, block_k=128, sf_block_m=cfg.sf_block_m)
-        total = get_direct_pull_cache_layout(layout.field_end, block_m, hidden).end
+        total = get_direct_pull_cache_layout(layout.field_end, block_m, hidden, direct_pipeline).end
         if total <= SMEM_CAPACITY:
             return replace(cfg, num_stages=stages, dynamic_smem=total, shared_layout=layout)
     raise ValueError('direct-pull input cache leaves no space for two MMA stages')

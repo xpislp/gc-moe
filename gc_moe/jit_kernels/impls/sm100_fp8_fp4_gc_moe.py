@@ -557,6 +557,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                           context=None, *, low_latency=False, direct_pull=False):
     """Encode live maps once per pointer set and compile each role once/shape."""
     _check_supported(config, sym_buffer)
+    pipeline_mode = os.environ.get('GC_MOE_LL_DIRECT_PIPELINE', '1')
+    if pipeline_mode not in ('0', '1'):
+        raise ValueError('GC_MOE_LL_DIRECT_PIPELINE must be 0 or 1')
+    direct_pipeline = low_latency and direct_pull and config.hidden >= 1024 and pipeline_mode == '1'
     small_tile_path = use_small_tile_path(config.shared_experts, config.block_m)
     map_count = 22 if small_tile_path else 18
     if config.shared_experts != sym_buffer.num_shared_experts:
@@ -581,7 +585,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if low_latency:
         role_configs = tuple(get_ll_role_config(role, config.block_m,
             sym_buffer.num_experts, config.hidden, local_experts=config.local_experts,
-            direct_pull=direct_pull) for role in (1, 2, 3))
+            direct_pull=direct_pull, direct_pipeline=direct_pipeline) for role in (1, 2, 3))
     else:
         role_configs = tuple(get_role_config(role, config.block_m,
                                              sym_buffer.num_experts,
@@ -610,7 +614,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     l1_group = int(os.environ.get('GC_MOE_LL_L1_GROUP', '2')) if low_latency and direct_pull else 1
     if l1_group not in (1, 2, 4, 8):
         raise ValueError('GC_MOE_LL_L1_GROUP must be 1, 2, 4 or 8')
-    key = (key, low_latency, direct_pull, l1_group)
+    key = (key, low_latency, direct_pull, l1_group, direct_pipeline)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -652,6 +656,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         routed_weight_linger=routed_weight_linger,
                         low_latency=low_latency, direct_pull=direct_pull, l1_group=l1_group,
+                        direct_pipeline=direct_pipeline,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)

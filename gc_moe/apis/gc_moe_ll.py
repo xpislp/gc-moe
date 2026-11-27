@@ -33,7 +33,10 @@ def fp8_fp4_gc_moe_ll(y, l1_weights, l2_weights, sym_buffer,
     context dispatch/compute kernels. Up to eight route CTAs gather each X
     once into the activation ring. direct_pull=True instead uses one metadata
     CTA and an MMA-ready compute-CTA SMEM input cache, with consecutive W1
-    N tiles sharing that cache. There is no second SMEM rearrangement. Direct pull is experimental and slower on the tested EP4
+    N tiles sharing that cache. For H >= 1024, K128 groups are prefetched
+    while MMA consumes earlier groups; peer addresses are resolved once per
+    cache miss. There is no second SMEM rearrangement. Direct pull remains
+    experimental and slower than the default LL path on the tested EP4
     GLM5.2 shapes; it is never selected implicitly.
     """
     config = validate_call(y, l1_weights, l2_weights, sym_buffer,

@@ -30,7 +30,8 @@ from ..common.math import (
     warp_group4_max,
 )
 from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
-from ..common.direct_pull import cache_peer_tile, publish_cached_stage
+from ..common.direct_pull import cache_peer_tile, publish_cached_stage, prefetch_peer_k_group, prepare_peer_sources
+from ..ptx.tma import copy_wait_groups, copy_wait
 from ..common.ll_routes import materialize_routes
 from ..layout.gc_moe import (
     ACCUM_BARRIER_STAGES,
@@ -275,7 +276,7 @@ class GCMoERoleKernel:
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, combine_geometry: tuple[int, int, int] | None = None,
                  routed_weight_linger: bool = False,
-                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1):
+                 low_latency: bool = False, direct_pull: bool = False, l1_group: int = 1, direct_pipeline: bool = False):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -294,6 +295,8 @@ class GCMoERoleKernel:
         self.l1_group = l1_group
         self.low_latency = low_latency
         self.direct_pull = direct_pull
+        self.direct_pipeline = direct_pipeline
+        self.direct_prefetch = min(6, hidden // 512)
         if low_latency and (local_experts % dispatch_sms or num_tokens > 32):
             raise ValueError("LL route grid must divide local experts and T <= 32")
         self.role = role
@@ -376,7 +379,7 @@ class GCMoERoleKernel:
                 (num_tokens * self.combine_chunks + COMBINE_WARPS - 1) // COMBINE_WARPS))
         self.shared_layout = role_config.shared_layout
         self.direct_cache = (get_direct_pull_cache_layout(
-            self.shared_layout.field_end, block_m, hidden)
+            self.shared_layout.field_end, block_m, hidden, direct_pipeline)
             if direct_pull and role == 2 else None)
         self.smem_bytes = (self.direct_cache.end if self.direct_cache is not None
                            else self.shared_layout.field_end)
@@ -1246,6 +1249,9 @@ class GCMoERoleKernel:
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
                 cached_pool = Uint32(0xffffffff)
+                if cutlass.const_expr(self.direct_pipeline):
+                    peer_x_sources = cute.make_rmem_tensor((self.block_m // 8,), Uint64)
+                    peer_sf_sources = cute.make_rmem_tensor((self.block_m // 8,), Uint64)
                 running = True
                 while running:
                     task_stage = task_iter % Uint32(2)
@@ -1306,6 +1312,7 @@ class GCMoERoleKernel:
                         # The conversion is full-warp, before elected TMA.
                         activation_map = generic_tensormap_ptr(activation_map)
                         activation_sf_map = generic_tensormap_ptr(activation_sf_map)
+                        cache_miss = False
                         if task_phase == Uint32(GCBlockPhase.Linear1):
                             l1_full_ptr = signals.iterator + \
                                 SIGNAL_OFFSETS['l1_full_count'] // 4 + block_idx
@@ -1321,13 +1328,33 @@ class GCMoERoleKernel:
                                         cute.arch.mbarrier_wait(
                                             accum_full + (task_iter - Uint32(1)) % Uint32(self.accum_stages),
                                             ((task_iter - Uint32(1)) // Uint32(self.accum_stages)) % Uint32(2))
-                                    cache_peer_tile(
-                                        signals, peer_ptrs, slab + self.direct_cache.x,
-                                        cute.recast_ptr(slab + self.direct_cache.sf, dtype=Uint32),
-                                        pool_block, valid_m, cta_rank, Uint32(lane),
-                                        self.block_m, self.hidden, self.num_ranks,
-                                        self.metadata_words, self.input_x_words, self.input_sf_words,
-                                        self.direct_cache.sf_stride, self.direct_cache.sf_words)
+                                    if cutlass.const_expr(self.direct_pipeline):
+                                        cache_miss = True
+                                        prepare_peer_sources(signals, peer_ptrs, peer_x_sources, peer_sf_sources,
+                                            pool_block, valid_m, cta_rank, Uint32(lane),
+                                            self.block_m, self.hidden, self.num_ranks,
+                                            self.metadata_words, self.input_x_words, self.input_sf_words)
+                                        if elect_one_sync():
+                                            bulk_zero_shared(slab + self.direct_cache.x,
+                                                Uint32(self.block_m // 2 * self.hidden))
+                                            bulk_zero_shared(slab + self.direct_cache.sf,
+                                                Uint32(self.direct_cache.sf_words * 4))
+                                        cute.arch.sync_warp()
+                                        tma_store_fence()
+                                        for initial in cutlass.range_constexpr(self.direct_prefetch):
+                                            prefetch_peer_k_group(peer_x_sources, peer_sf_sources,
+                                                slab + self.direct_cache.x,
+                                                cute.recast_ptr(slab + self.direct_cache.sf, dtype=Uint32),
+                                                valid_m, cta_rank, Uint32(lane), Uint32(initial * 4), self.block_m,
+                                                self.direct_cache.sf_stride)
+                                    else:
+                                        cache_peer_tile(
+                                            signals, peer_ptrs, slab + self.direct_cache.x,
+                                            cute.recast_ptr(slab + self.direct_cache.sf, dtype=Uint32),
+                                            pool_block, valid_m, cta_rank, Uint32(lane),
+                                            self.block_m, self.hidden, self.num_ranks,
+                                            self.metadata_words, self.input_x_words, self.input_sf_words,
+                                            self.direct_cache.sf_stride, self.direct_cache.sf_words)
                                     cached_pool = pool_block
                         if cutlass.const_expr(self.shared_experts > 0):
                             if task_phase == Uint32(GCBlockPhase.SharedLinear2):
@@ -1354,6 +1381,20 @@ class GCMoERoleKernel:
                                     pending = ld_acquire_gpu_u64(mask_ptr) ^ expected
                             if cutlass.const_expr(self.direct_pull):
                                 if task_phase == Uint32(GCBlockPhase.Linear1):
+                                    if cutlass.const_expr(self.direct_pipeline):
+                                        if cache_miss and k_block % Uint32(4) == Uint32(0):
+                                            if k_block + Uint32((self.direct_prefetch - 1) * 4) < shape_k // Uint32(128):
+                                                copy_wait_groups(self.direct_prefetch - 1)
+                                            else:
+                                                copy_wait()
+                                            cute.arch.sync_warp()
+                                            tma_store_fence()
+                                            if k_block + Uint32(self.direct_prefetch * 4) < shape_k // Uint32(128):
+                                                prefetch_peer_k_group(peer_x_sources, peer_sf_sources,
+                                                    slab + self.direct_cache.x,
+                                                    cute.recast_ptr(slab + self.direct_cache.sf, dtype=Uint32),
+                                                    valid_m, cta_rank, Uint32(lane), k_block + Uint32(self.direct_prefetch * 4), self.block_m,
+                                                    self.direct_cache.sf_stride)
                                     publish_cached_stage(data_full + data_stage,
                                                          data_empty + data_stage, data_phase)
                                 else:

@@ -100,7 +100,7 @@ def stage(buffer, x, idx, prob, tokens, experts, world, topk, variant):
     buffer.topk_weights[:tokens].copy_(prob)
     if buffer.num_shared_experts:
         query = gc_moe.get_block_m_for_gc_moe if variant == "gc" else gc_moe.get_block_m_for_gc_moe_ll
-        query_options = {} if variant == "gc" else dict(direct_pull=variant == "ll_direct")
+        query_options = {} if variant == "gc" else dict(direct_pull=variant in ("ll_direct", "ll_pipeline"))
         bm = query(world, experts, buffer.num_max_tokens_per_rank, tokens, topk, **query_options)
         rows = torch.arange(tokens, device='cuda')
         u = rows % bm
@@ -134,6 +134,7 @@ def main():
     p.add_argument('--patterns', default='balanced,random,skew,empty,mixed')
     p.add_argument('--repeats', type=int, default=7)
     p.add_argument('--graph-calls', type=int, default=20)
+    p.add_argument('--warmup-graphs', type=int, default=20)
     p.add_argument('--profile', action='store_true')
     p.add_argument('--output', default='results/gc_moe_ll.json')
     args = p.parse_args()
@@ -166,8 +167,17 @@ def main():
         ys = {v: torch.empty((tokens,h),device=device,dtype=torch.bfloat16) for v in variants}
         def call(v):
             fn = gc_moe.fp8_fp4_gc_moe if v == 'gc' else gc_moe.fp8_fp4_gc_moe_ll
-            kwargs = {} if v in ('gc', 'll') else dict(direct_pull=v=='ll_direct')
-            fn(ys[v], *weights, buffers[v], *sw, shared_recipe=(1,128,128), **kwargs)
+            kwargs = {} if v in ('gc', 'll') else dict(direct_pull=v in ('ll_direct', 'll_pipeline'))
+            previous = os.environ.get('GC_MOE_LL_DIRECT_PIPELINE')
+            if v in ('ll_direct', 'll_pipeline'):
+                os.environ['GC_MOE_LL_DIRECT_PIPELINE'] = '1' if v == 'll_pipeline' else '0'
+            try:
+                fn(ys[v], *weights, buffers[v], *sw, shared_recipe=(1,128,128), **kwargs)
+            finally:
+                if previous is None:
+                    os.environ.pop('GC_MOE_LL_DIRECT_PIPELINE', None)
+                else:
+                    os.environ['GC_MOE_LL_DIRECT_PIPELINE'] = previous
         graphs = {}
         for pattern_index, pattern in enumerate(args.patterns.split(',')):
             torch.manual_seed(1000 + rank + tokens + pattern_index * 10000)
@@ -197,7 +207,7 @@ def main():
                         for _ in range(args.graph_calls): call(v)
                     graphs[v] = graph
                 # Replay a graph captured with old routing after changing its inputs.
-                for _ in range(3): graphs[v].replay()
+                for _ in range(max(3, args.warmup_graphs) if pattern == 'balanced' else 3): graphs[v].replay()
                 torch.cuda.synchronize()
                 errs = metrics(ys[v],expected)
                 results.append(dict(tokens=tokens,pattern=pattern,variant=v,accuracy=errs))

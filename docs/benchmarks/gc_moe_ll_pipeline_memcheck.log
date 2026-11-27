@@ -1,0 +1,12 @@
+CONFIG {'tokens': '4,32', 'hidden': 6144, 'intermediate': 2048, 'local_experts': 8, 'topk': 8, 'shared': 1, 'variants': 'll_pipeline', 'patterns': 'balanced,random,skew,empty,mixed', 'repeats': 1, 'graph_calls': 1, 'warmup_graphs': 3, 'profile': False, 'output': 'results/pipeline-memcheck.json'} EP 4
+CHECK 4 balanced ll_pipeline
+CHECK 4 random ll_pipeline
+CHECK 4 skew ll_pipeline
+CHECK 4 empty ll_pipeline
+CHECK 4 mixed ll_pipeline
+CHECK 32 balanced ll_pipeline
+CHECK 32 random ll_pipeline
+CHECK 32 skew ll_pipeline
+CHECK 32 empty ll_pipeline
+CHECK 32 mixed ll_pipeline
+========= ERROR SUMMARY: 0 errors

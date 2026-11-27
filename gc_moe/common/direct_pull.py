@@ -90,3 +90,68 @@ def publish_cached_stage(full: cute.Pointer, empty: cute.Pointer, phase: Uint32)
     cute.arch.mbarrier_wait(empty, phase ^ Uint32(1))
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive(full, peer_cta_rank_in_cluster=0)
+
+
+@cute.jit
+def prepare_peer_sources(signals: cute.Tensor, peers: cute.Tensor,
+                         xp: cute.Tensor, sp: cute.Tensor,
+                         pool_block: Uint32, valid_m: Uint32,
+                         cta_rank: Uint32, lane: Uint32,
+                         bm: cutlass.Constexpr, hidden: cutlass.Constexpr,
+                         ranks: cutlass.Constexpr, metadata_words: cutlass.Constexpr,
+                         x_words: cutlass.Constexpr, sf_words: cutlass.Constexpr):
+    """Resolve peer/token addresses once per cache miss, outside the K loop."""
+    half = ((valid_m + Uint32(15)) & Uint32(~15)) // Uint32(2)
+    start = cta_rank * half
+    for rows in cutlass.range_constexpr(bm // 8):
+        row = Uint32(rows * 4) + lane // Uint32(8)
+        logical = start + row
+        base = Uint64(signals.iterator.toint())
+        token = Uint32(0)
+        if row < half and logical < valid_m:
+            meta = metadata_words + (pool_block * Uint32(bm) + logical) * Uint32(3)
+            base = mapped_peer_base(peers, Uint32(signals[meta]), ranks)
+            token = Uint32(signals[meta + 1])
+        xp[rows] = base + Uint64(x_words * 4) + Uint64(token) * Uint64(hidden) + Uint64(lane % Uint32(8) * Uint32(16))
+        sf_row = Uint32(rows * 8) + lane // Uint32(4)
+        base = Uint64(signals.iterator.toint())
+        token = Uint32(0)
+        if sf_row < valid_m:
+            meta = metadata_words + (pool_block * Uint32(bm) + sf_row) * Uint32(3)
+            base = mapped_peer_base(peers, Uint32(signals[meta]), ranks)
+            token = Uint32(signals[meta + 1])
+        sp[rows] = base + Uint64(sf_words * 4) + Uint64(token) * Uint64(hidden // 128 * 4)
+
+
+@cute.jit
+def prefetch_peer_k_group(xp: cute.Tensor, sp: cute.Tensor,
+                           cache_x: cute.Pointer, cache_sf: cute.Pointer,
+                           valid_m: Uint32, cta_rank: Uint32, lane: Uint32,
+                           first_k: Uint32, bm: cutlass.Constexpr,
+                           sf_stride: cutlass.Constexpr):
+    """One async group, four K128 tiles in their final immutable cache slots."""
+    half = ((valid_m + Uint32(15)) & Uint32(~15)) // Uint32(2)
+    start = cta_rank * half
+    for rows in cutlass.range_constexpr(bm // 8):
+        if Uint32(rows * 4) < min(half, valid_m - min(valid_m, start)):
+            row = Uint32(rows * 4) + lane // Uint32(8)
+            logical = start + row
+            valid = row < half and logical < valid_m
+            off = row * Uint32(128) + lane % Uint32(8) * Uint32(16)
+            swz = off ^ ((off >> Uint32(7) & Uint32(7)) << Uint32(4))
+            for sub in cutlass.range_constexpr(4):
+                kb = first_k + Uint32(sub)
+                src = cute.make_ptr(Uint8, xp[rows] + Uint64(kb * 128), cute.AddressSpace.gmem,
+                    assumed_align=16)
+                copy_async_16(cache_x + kb * Uint32(bm // 2 * 128) + swz,
+                              src, Uint32(16) if valid else Uint32(0))
+    for rows in cutlass.range_constexpr(bm // 8):
+        if Uint32(rows * 8) < valid_m:
+            row = Uint32(rows * 8) + lane // Uint32(4)
+            packed = row % Uint32(32) * Uint32(4) + row // Uint32(32)
+            kb = first_k + lane % Uint32(4)
+            src = cute.make_ptr(Uint32, sp[rows] + Uint64(kb * 4),
+                cute.AddressSpace.gmem)
+            copy_async_4(cache_sf + kb * Uint32(sf_stride) + packed, src,
+                         Uint32(4) if row < valid_m else Uint32(0))
+    copy_commit()

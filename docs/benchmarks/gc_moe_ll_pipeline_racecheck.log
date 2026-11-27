@@ -1,0 +1,5 @@
+CONFIG {'tokens': '17', 'hidden': 1536, 'intermediate': 2048, 'local_experts': 8, 'topk': 8, 'shared': 1, 'variants': 'll_pipeline', 'patterns': 'balanced,skew,mixed', 'repeats': 1, 'graph_calls': 1, 'warmup_graphs': 3, 'profile': False, 'output': 'results/pipeline-racecheck.json'} EP 4
+CHECK 17 balanced ll_pipeline
+CHECK 17 skew ll_pipeline
+CHECK 17 mixed ll_pipeline
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
